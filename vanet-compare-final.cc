@@ -1,387 +1,475 @@
 /*
- * Master Simulation Script for Figure 10 Replication
- * Protocol Support: SDN (Hybrid), AODV, OLSR, DSDV
- * Features: 
- * - SUMO Mobility Traces
- * - Hybrid SDN Application (Magic LTE Control Plane)
- * - Static ARP Injection (Fixes Layer 2 Drops)
- * - Smart Pair Selection (Ensures physical connectivity)
+ * Final Comparison: SDN vs Traditional
+ * HYBRID APPROACH (Best of Both Worlds):
+ * 1. Uses VehicleSdnApp (Beacons + Reports) for REALISM.
+ * 2. Uses Controller Distance Check (Logic from your working code) for RELIABILITY.
+ * 3. Uses IP Forwarding & Route Purging for CORRECTNESS.
  */
 
- #include "ns3/core-module.h"
- #include "ns3/network-module.h"
- #include "ns3/mobility-module.h"
- #include "ns3/wifi-module.h"
- #include "ns3/internet-module.h"
- #include "ns3/applications-module.h"
- #include "ns3/ipv4-static-routing.h"
- #include "ns3/ipv4-list-routing.h"
- #include "ns3/flow-monitor-module.h"
- #include "ns3/aodv-module.h"
- #include "ns3/olsr-module.h"
- #include "ns3/dsdv-module.h"
- #include "ns3/arp-cache.h"
- #include "ns3/ipv4-l3-protocol.h"
- 
- #include <queue>
- #include <sstream>
- #include <set>
- #include <map>
- 
- using namespace ns3;
- 
- NS_LOG_COMPONENT_DEFINE("VanetCompareFinal");
- 
- namespace ns3 {
- 
- // --- HELPER: Get IP Address ---
- Ipv4Address GetNodeIpv4Address(Ptr<Node> node) {
-     Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
-     for (uint32_t i = 0; i < ipv4->GetNInterfaces(); ++i) {
-         for (uint32_t j = 0; j < ipv4->GetNAddresses(i); ++j) {
-             Ipv4Address addr = ipv4->GetAddress(i, j).GetLocal();
-             if (addr != Ipv4Address::GetLoopback() && addr != Ipv4Address::GetZero()) {
-                 return addr;
-             }
-         }
-     }
-     return Ipv4Address::GetZero();
- }
- 
- // Forward Declaration
- class VehicleSdnApp;
- 
- // --- CONTROLLER APP ---
- class SdnControllerApp : public Application {
- public:
-     static TypeId GetTypeId();
-     SdnControllerApp();
-     
-     // "Magic" LTE Interface (Direct calls from Vehicles)
-     void ReceiveReport(Ipv4Address nodeIp, std::set<Ipv4Address> neighbors);
-     void RegisterVehicle(Ipv4Address ip, Ptr<VehicleSdnApp> app);
- 
- private:
-     virtual void StartApplication();
-     virtual void StopApplication();
-     void RecomputeRoutes();
- 
-     std::map<Ipv4Address, std::set<Ipv4Address>> m_topology;
-     std::map<Ipv4Address, Ptr<VehicleSdnApp>> m_vehicleMap; // IP -> App Pointer
- };
- 
- // --- VEHICLE APP ---
- class VehicleSdnApp : public Application {
- public:
-     static TypeId GetTypeId();
-     VehicleSdnApp();
-     void SetController(Ptr<SdnControllerApp> controller);
-     
-     // "Magic" LTE Interface (Direct calls from Controller)
-     void InstallRoute(Ipv4Address dst, Ipv4Address nextHop);
- 
- private:
-     virtual void StartApplication();
-     virtual void StopApplication();
-     void SendBeacon();
-     void ReceiveBeacon(Ptr<Socket> socket);
-     void SendReport(); // Calls Controller->ReceiveReport
- 
-     Ptr<Socket> m_beaconTx;
-     Ptr<Socket> m_beaconRx;
-     Ptr<SdnControllerApp> m_controller;
-     std::set<Ipv4Address> m_neighbors;
- };
- 
- // ============================================================================
- //  IMPLEMENTATION
- // ============================================================================
- 
- // --- CONTROLLER ---
- NS_OBJECT_ENSURE_REGISTERED(SdnControllerApp);
- TypeId SdnControllerApp::GetTypeId() {
-     static TypeId tid = TypeId("ns3::SdnControllerApp").SetParent<Application>().AddConstructor<SdnControllerApp>();
-     return tid;
- }
- SdnControllerApp::SdnControllerApp() {}
- void SdnControllerApp::StartApplication() {
-     Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
-     NS_LOG_UNCOND("SDN Controller Started (Magic LTE Mode)");
- }
- void SdnControllerApp::StopApplication() {}
- 
- void SdnControllerApp::RegisterVehicle(Ipv4Address ip, Ptr<VehicleSdnApp> app) {
-     m_vehicleMap[ip] = app;
- }
- 
- void SdnControllerApp::ReceiveReport(Ipv4Address nodeIp, std::set<Ipv4Address> neighbors) {
-     m_topology[nodeIp] = neighbors;
- }
- 
- static std::map<Ipv4Address, Ipv4Address> ComputeNextHop(const std::map<Ipv4Address, std::set<Ipv4Address>>& topo, Ipv4Address src) {
-     std::map<Ipv4Address, Ipv4Address> nextHop;
-     std::queue<Ipv4Address> q;
-     std::set<Ipv4Address> visited;
-     q.push(src);
-     visited.insert(src);
-     while (!q.empty()) {
-         Ipv4Address u = q.front(); q.pop();
-         if (topo.find(u) == topo.end()) continue;
-         for (auto v : topo.at(u)) {
-             if (!visited.count(v)) {
-                 visited.insert(v);
-                 q.push(v);
-                 nextHop[v] = (u == src) ? v : nextHop[u];
-             }
-         }
-     }
-     return nextHop;
- }
- 
- void SdnControllerApp::RecomputeRoutes() {
-     int routesCount = 0;
-     for (auto& entry : m_topology) {
-         Ipv4Address srcIp = entry.first;
-         if (m_vehicleMap.find(srcIp) == m_vehicleMap.end()) continue;
- 
-         auto nhMap = ComputeNextHop(m_topology, srcIp);
-         Ptr<VehicleSdnApp> vehicle = m_vehicleMap[srcIp];
- 
-         for (auto& p : nhMap) {
-             vehicle->InstallRoute(p.first, p.second);
-             routesCount++;
-         }
-     }
-     Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
- }
- 
- // --- VEHICLE ---
- NS_OBJECT_ENSURE_REGISTERED(VehicleSdnApp);
- TypeId VehicleSdnApp::GetTypeId() {
-     static TypeId tid = TypeId("ns3::VehicleSdnApp").SetParent<Application>().AddConstructor<VehicleSdnApp>();
-     return tid;
- }
- VehicleSdnApp::VehicleSdnApp() {}
- void VehicleSdnApp::SetController(Ptr<SdnControllerApp> controller) { m_controller = controller; }
- 
- void VehicleSdnApp::StartApplication() {
-     m_beaconTx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-     m_beaconTx->SetAllowBroadcast(true);
-     m_beaconRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-     m_beaconRx->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8888));
-     m_beaconRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveBeacon, this));
- 
-     Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendBeacon, this);
-     Simulator::Schedule(Seconds(1.0), &VehicleSdnApp::SendReport, this);
- }
- void VehicleSdnApp::StopApplication() {
-     if(m_beaconTx) m_beaconTx->Close();
-     if(m_beaconRx) m_beaconRx->Close();
- }
- void VehicleSdnApp::SendBeacon() {
-     Ptr<Packet> p = Create<Packet>(10);
-     m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), 8888));
-     Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendBeacon, this);
- }
- void VehicleSdnApp::ReceiveBeacon(Ptr<Socket> socket) {
-     Address from;
-     socket->RecvFrom(from);
-     m_neighbors.insert(InetSocketAddress::ConvertFrom(from).GetIpv4());
- }
- void VehicleSdnApp::SendReport() {
-     // "Magic" LTE: Direct function call
-     if (m_controller) {
-         Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
-         Ipv4Address myIp = ipv4->GetAddress(1, 0).GetLocal();
-         m_controller->ReceiveReport(myIp, m_neighbors);
-     }
-     m_neighbors.clear();
-     Simulator::Schedule(Seconds(1.0), &VehicleSdnApp::SendReport, this);
- }
- void VehicleSdnApp::InstallRoute(Ipv4Address dst, Ipv4Address nh) {
-    Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
-    Ptr<Ipv4StaticRouting> staticRouting;
-    Ptr<Ipv4RoutingProtocol> rp = ipv4->GetRoutingProtocol();
-    
-    // 1. Get Static Routing Protocol
-    if (DynamicCast<Ipv4ListRouting>(rp)) {
-        Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>(rp);
-        int16_t priority;
-        for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++) {
-            Ptr<Ipv4RoutingProtocol> temp = lr->GetRoutingProtocol(i, priority);
-            if (DynamicCast<Ipv4StaticRouting>(temp)) {
-                staticRouting = DynamicCast<Ipv4StaticRouting>(temp);
-                break;
-            }
-        }
-    } else {
-        staticRouting = DynamicCast<Ipv4StaticRouting>(rp);
-    }
-    
-    // 2. Install Static Route
-    if (staticRouting) {
-        staticRouting->AddHostRouteTo(dst, nh, 1, 1);
-    }
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/wifi-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/netanim-module.h" 
+#include "ns3/ipv4-static-routing-helper.h"
+#include "ns3/ipv4-list-routing-helper.h"
+#include "ns3/aodv-module.h"
+#include "ns3/dsdv-module.h"
+#include "ns3/olsr-module.h"
 
-    // 3. CRITICAL FIX: Pre-fill ARP Cache (Layer 2)
-    // Fix: Cast to Ipv4L3Protocol to access GetInterface()
-    Ptr<Ipv4L3Protocol> ipv4l3 = DynamicCast<Ipv4L3Protocol>(ipv4);
-    if (!ipv4l3) return;
+#include <vector>
+#include <map>
+#include <set>
+#include <queue>
+#include <string>
+#include <sstream>
 
-    int32_t interfaceIndex = 1; // WiFi Interface
-    Ptr<ArpCache> arpCache = ipv4l3->GetInterface(interfaceIndex)->GetArpCache();
-    
-    if (arpCache) {
-        Mac48Address nhMac;
-        bool found = false;
-        
-        // Find MAC of Next Hop by scanning Global Node List
-        for (uint32_t i = 0; i < NodeList::GetNNodes(); ++i) {
-            Ptr<Node> candidate = NodeList::GetNode(i);
-            Ptr<Ipv4> candIpv4 = candidate->GetObject<Ipv4>();
-            // Check IP on Interface 1
-            if (candIpv4->GetNInterfaces() > 1 && candIpv4->GetAddress(1,0).GetLocal() == nh) {
-                Ptr<NetDevice> candDev = candIpv4->GetNetDevice(1); 
-                nhMac = Mac48Address::ConvertFrom(candDev->GetAddress());
-                found = true;
-                break;
-            }
-        }
-        
-        if (found) {
-            ArpCache::Entry *entry = arpCache->Add(nh);
-            entry->MarkAlive(nhMac); 
-            // Fix: Removed 'SetIsStatic'. MarkAlive is sufficient.
-            // Timeout is handled globally in main().
-        }
-    }
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE ("VanetCompareFinal");
+
+NodeContainer* g_sdnNodes = nullptr;
+
+// ============================================================================
+//                          SDN HELPER FUNCTIONS
+// ============================================================================
+
+Ipv4Address GetNodeIpv4Address(Ptr<Node> node, uint32_t ifIndex) {
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+    if (!ipv4 || ifIndex >= ipv4->GetNInterfaces()) return Ipv4Address::GetZero();
+    return ipv4->GetAddress(ifIndex, 0).GetLocal();
 }
- 
- } // End namespace
- 
- // ============================================================================
- //  MAIN
- // ============================================================================
- 
- int main(int argc, char *argv[]) {
-     std::string protocol = "SDN"; 
-     uint32_t nNodes = 50;          
-     double simTime = 300.0;        
-     uint32_t run = 1;
-     uint32_t speed = 20;           
- 
-     CommandLine cmd;
-     cmd.AddValue("protocol", "Protocol", protocol);
-     cmd.AddValue("nodes", "Nodes", nNodes);
-     cmd.AddValue("speed", "Speed", speed);
-     cmd.AddValue("run", "Run", run);
-     cmd.Parse(argc, argv);
-     RngSeedManager::SetSeed(112233);
-     RngSeedManager::SetRun(run);
- 
-     Config::SetDefault ("ns3::RandomRectanglePositionAllocator::X", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=1000.0]"));
-     Config::SetDefault ("ns3::RandomRectanglePositionAllocator::Y", StringValue ("ns3::UniformRandomVariable[Min=0.0|Max=1000.0]"));
- 
-     // Prevent ARP entries from expiring (effectively making them static)
-    Config::SetDefault("ns3::ArpCache::AliveTimeout", TimeValue(Seconds(10000.0)));
-     NodeContainer controllerNode; controllerNode.Create(1);
-     NodeContainer vehicleNodes;   vehicleNodes.Create(nNodes);
-     NodeContainer allNodes;       allNodes.Add(controllerNode); allNodes.Add(vehicleNodes);
- 
-     MobilityHelper mobilityCtrl;
-     mobilityCtrl.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-     mobilityCtrl.Install(controllerNode);
-     controllerNode.Get(0)->GetObject<ConstantPositionMobilityModel>()->SetPosition(Vector(500, 500, 0));
- 
-     std::ostringstream traceFile;
-     traceFile << "scratch/mobility_" << speed << "ms.tcl";
-     Ns2MobilityHelper ns2 = Ns2MobilityHelper(traceFile.str());
-     ns2.Install(vehicleNodes.Begin(), vehicleNodes.End());
- 
-     WifiHelper wifi;
-     wifi.SetStandard(WIFI_STANDARD_80211p);
-     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager", "DataMode", StringValue("OfdmRate6MbpsBW10MHz"));
-     YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
-     channel.AddPropagationLoss("ns3::FriisPropagationLossModel", "Frequency", DoubleValue(5.9e9));
-     YansWifiPhyHelper phy;
-     phy.SetChannel(channel.Create());
-     phy.Set("TxPowerStart", DoubleValue(20.0)); 
-     phy.Set("TxPowerEnd", DoubleValue(20.0));
-     WifiMacHelper mac;
-     mac.SetType("ns3::AdhocWifiMac");
-     NetDeviceContainer devices = wifi.Install(phy, mac, allNodes);
- 
-     InternetStackHelper internet;
-     if (protocol == "AODV") { internet.SetRoutingHelper(AodvHelper()); internet.Install(allNodes); }
-     else if (protocol == "OLSR") { internet.SetRoutingHelper(OlsrHelper()); internet.Install(allNodes); }
-     else if (protocol == "DSDV") { internet.SetRoutingHelper(DsdvHelper()); internet.Install(allNodes); }
-     else if (protocol == "SDN") { internet.Install(allNodes); }
-     else { NS_FATAL_ERROR("Unknown Protocol"); }
- 
-     Ipv4AddressHelper ipv4;
-     ipv4.SetBase("10.1.0.0", "255.255.0.0");
-     Ipv4InterfaceContainer ifs = ipv4.Assign(devices);
- 
-     // --- SDN SETUP ---
-     if (protocol == "SDN") {
-         Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
-         controllerNode.Get(0)->AddApplication(ctrlApp);
-         ctrlApp->SetStartTime(Seconds(0.5));
- 
-         for (uint32_t i = 0; i < vehicleNodes.GetN(); ++i) {
-             Ptr<VehicleSdnApp> vehApp = CreateObject<VehicleSdnApp>();
-             vehApp->SetController(ctrlApp);
-             vehicleNodes.Get(i)->AddApplication(vehApp);
-             vehApp->SetStartTime(Seconds(1.0 + i * 0.01));
-             
-             // Register vehicle IP with controller
-             // Vehicle i is at IP index i+1 (Index 0 is Controller)
-             Ipv4Address vehIp = ifs.GetAddress(i + 1);
-             ctrlApp->RegisterVehicle(vehIp, vehApp);
-         }
-     }
- 
-     // --- TRAFFIC (Smart Selection) ---
-     Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable>();
-     int dstIdx = -1, srcIdx = -1;
-     bool foundPair = false;
-     for (int attempts = 0; attempts < 100; ++attempts) {
-         int s = rng->GetInteger(0, nNodes - 1);
-         int d = rng->GetInteger(0, nNodes - 1);
-         if (s == d) continue;
-         Ptr<MobilityModel> m1 = vehicleNodes.Get(s)->GetObject<MobilityModel>();
-         Ptr<MobilityModel> m2 = vehicleNodes.Get(d)->GetObject<MobilityModel>();
-         double dist = m1->GetDistanceFrom(m2);
-         // Smart Selection: Must be >250m (multihop) but <700m (reachable)
-         if (dist > 250.0 && dist < 700.0) { srcIdx=s; dstIdx=d; foundPair=true; break; }
-     }
-     if (!foundPair) { srcIdx=0; dstIdx=1; }
-     
-     // Get Dest IP directly from Node Object (Avoids Index Math Bugs)
-     Ptr<Node> destNode = vehicleNodes.Get(dstIdx);
-     Ptr<Ipv4> ipv4Dest = destNode->GetObject<Ipv4>();
-     Ipv4Address dstIp = ipv4Dest->GetAddress(1, 0).GetLocal();
-     
-     NS_LOG_UNCOND("TRAFFIC: SrcNode=" << vehicleNodes.Get(srcIdx)->GetId() << " DstNode=" << destNode->GetId() << " DstIP=" << dstIp);
- 
-     UdpEchoServerHelper server(9);
-     server.Install(vehicleNodes.Get(dstIdx)).Start(Seconds(1.0));
-     UdpEchoClientHelper client(dstIp, 9);
-     client.SetAttribute("Interval", TimeValue(Seconds(0.25)));
-     client.SetAttribute("PacketSize", UintegerValue(1024));
-     client.SetAttribute("MaxPackets", UintegerValue(1000));
-     client.Install(vehicleNodes.Get(srcIdx)).Start(Seconds(5.0));
- 
-     FlowMonitorHelper flowmon;
-     Ptr<FlowMonitor> monitor = flowmon.InstallAll();
- 
-     Simulator::Stop(Seconds(simTime));
-     Simulator::Run();
-     
-     std::ostringstream fileName;
-     fileName << "results_" << protocol << "_" << speed << "_" << run << ".xml";
-     monitor->CheckForLostPackets();
-     monitor->SerializeToXmlFile(fileName.str(), true, true);
-     Simulator::Destroy();
-     return 0;
- }
+
+Ptr<Node> FindNodeByCtrlIp(Ipv4Address ctrlIp) {
+  if (!g_sdnNodes) return nullptr;
+  for (uint32_t i = 0; i < g_sdnNodes->GetN(); ++i) {
+      Ptr<Ipv4> ipv4 = g_sdnNodes->Get(i)->GetObject<Ipv4>();
+      for (uint32_t j = 0; j < ipv4->GetNInterfaces(); ++j) {
+          if (ipv4->GetAddress(j, 0).GetLocal() == ctrlIp) return g_sdnNodes->Get(i);
+      }
+  }
+  return nullptr;
+}
+
+// ============================================================================
+//                              SDN VEHICLE APP
+// ============================================================================
+// Restored: Sends Beacons and Reports (Realism)
+class VehicleSdnApp : public Application {
+public:
+    static TypeId GetTypeId() {
+        static TypeId tid = TypeId("ns3::VehicleSdnApp").SetParent<Application>().AddConstructor<VehicleSdnApp>();
+        return tid;
+    }
+    VehicleSdnApp() : m_dataIfIndex(1), m_ctrlIfIndex(2) {}
+    void Setup(Ipv4Address controllerIp, uint32_t dataIfIndex, uint32_t ctrlIfIndex) {
+        m_controllerIp = controllerIp; m_dataIfIndex = dataIfIndex; m_ctrlIfIndex = ctrlIfIndex;
+    }
+private:
+    virtual void StartApplication() {
+        // Beacon TX (Data Interface)
+        m_beaconTx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_beaconTx->SetAllowBroadcast(true);
+        m_beaconTx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_dataIfIndex), 0));
+
+        // Beacon RX
+        m_beaconRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_beaconRx->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8888));
+        m_beaconRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveBeacon, this));
+
+        // Control RX (Route Updates)
+        m_ctrlRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_ctrlRx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 10000));
+        m_ctrlRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveRoute, this));
+
+        double jitter = (double)(GetNode()->GetId()) * 0.01; 
+        m_beaconEvent = Simulator::Schedule(Seconds(0.5 + jitter), &VehicleSdnApp::SendBeacon, this);
+        m_reportEvent = Simulator::Schedule(Seconds(1.0 + jitter), &VehicleSdnApp::SendReport, this);
+    }
+
+    virtual void StopApplication() {
+        Simulator::Cancel(m_beaconEvent); Simulator::Cancel(m_reportEvent);
+        if(m_beaconTx) m_beaconTx->Close(); if(m_beaconRx) m_beaconRx->Close(); if(m_ctrlRx) m_ctrlRx->Close();
+    }
+
+    void SendBeacon() {
+        // Broadcast Control IP (so neighbor knows who to report)
+        std::ostringstream oss; oss << GetNodeIpv4Address(GetNode(), m_ctrlIfIndex);
+        std::string data = oss.str();
+        Ptr<Packet> p = Create<Packet>((uint8_t*)data.c_str(), data.size());
+        m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), 8888));
+        m_beaconEvent = Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendBeacon, this);
+    }
+
+    void ReceiveBeacon(Ptr<Socket> socket) {
+        Address from; Ptr<Packet> pkt = socket->RecvFrom(from);
+        if (pkt->GetSize() == 0) return;
+        std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0); pkt->CopyData(buffer.data(), pkt->GetSize());
+        std::string senderIpStr((char*)buffer.data());
+        if (senderIpStr.find(".") == std::string::npos) return;
+        Ipv4Address neighborCtrlIp(senderIpStr.c_str());
+        // Store Neighbor Control IP
+        if (neighborCtrlIp != GetNodeIpv4Address(GetNode(), m_ctrlIfIndex) && neighborCtrlIp != Ipv4Address::GetZero()) 
+            m_neighbors.insert(neighborCtrlIp);
+    }
+
+    void SendReport() {
+        // Msg: "MyCtrlIP Nbr1CtrlIP Nbr2CtrlIP..."
+        std::ostringstream ss; ss << GetNodeIpv4Address(GetNode(), m_ctrlIfIndex); 
+        for (const auto& n : m_neighbors) ss << " " << n;
+        std::string data = ss.str();
+        Ptr<Packet> pkt = Create<Packet>((uint8_t*)data.c_str(), data.size());
+        Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0)); 
+        s->Connect(InetSocketAddress(m_controllerIp, 9999));
+        s->Send(pkt); s->Close();
+        m_neighbors.clear();
+        m_reportEvent = Simulator::Schedule(Seconds(1.0), &VehicleSdnApp::SendReport, this);
+    }
+
+    // Purge old routes to fix the "Append" bug
+    void PurgeSDNRoutes(Ptr<Ipv4StaticRouting> staticRouting) {
+        for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+            Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+            if (route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255")) {
+                 if (route.GetDest().IsBroadcast()) continue; 
+                 if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                     staticRouting->RemoveRoute(i-1);
+                 }
+            }
+        }
+    }
+
+    void ReceiveRoute(Ptr<Socket> socket) {
+        Address from; Ptr<Packet> pkt = socket->RecvFrom(from);
+        if (pkt->GetSize() == 0) return;
+        std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0); pkt->CopyData(buffer.data(), pkt->GetSize());
+        std::stringstream ss((char*)buffer.data());
+        
+        Ptr<Ipv4StaticRouting> staticRouting;
+        Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
+        Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+        if (lr) {
+            int16_t priority;
+            for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++) {
+                Ptr<Ipv4RoutingProtocol> temp = lr->GetRoutingProtocol(i, priority);
+                if (DynamicCast<Ipv4StaticRouting>(temp)) { staticRouting = DynamicCast<Ipv4StaticRouting>(temp); break; }
+            }
+        }
+        if (!staticRouting) return;
+
+        PurgeSDNRoutes(staticRouting);
+
+        std::string dstStr, nhStr;
+        while (ss >> dstStr >> nhStr) {
+            if (dstStr.find('.') == std::string::npos) continue;
+            // Routes are installed for DATA IPs on Interface 1 (m_dataIfIndex)
+            staticRouting->AddHostRouteTo(Ipv4Address(dstStr.c_str()), Ipv4Address(nhStr.c_str()), m_dataIfIndex, 0);
+        }
+    }
+
+    Ptr<Socket> m_beaconTx, m_beaconRx, m_ctrlRx;
+    Ipv4Address m_controllerIp;
+    uint32_t m_dataIfIndex, m_ctrlIfIndex;
+    std::set<Ipv4Address> m_neighbors;
+    EventId m_beaconEvent, m_reportEvent;
+};
+
+// --- CONTROLLER APP ---
+class SdnControllerApp : public Application {
+public:
+    static TypeId GetTypeId() {
+        static TypeId tid = TypeId("ns3::SdnControllerApp").SetParent<Application>().AddConstructor<SdnControllerApp>();
+        return tid;
+    }
+    SdnControllerApp() : m_ctrlIfIndex(1) {}
+    void SetCtrlIfIndex(uint32_t idx) { m_ctrlIfIndex = idx; }
+
+private:
+    virtual void StartApplication() {
+        m_recvSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_recvSocket->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 9999));
+        m_recvSocket->SetRecvCallback(MakeCallback(&SdnControllerApp::ReceiveReport, this));
+        m_routeEvent = Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
+    }
+    virtual void StopApplication() { Simulator::Cancel(m_routeEvent); if(m_recvSocket) m_recvSocket->Close(); }
+
+    void ReceiveReport(Ptr<Socket> socket) {
+        Address from; Ptr<Packet> pkt = socket->RecvFrom(from);
+        if (pkt->GetSize() == 0) return;
+        std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0); pkt->CopyData(buffer.data(), pkt->GetSize());
+        std::stringstream ss((char*)buffer.data());
+        
+        std::string srcCtrlIpStr, nbrCtrlIpStr;
+        ss >> srcCtrlIpStr; 
+        if (srcCtrlIpStr.empty()) return;
+        
+        Ptr<Node> srcNode = FindNodeByCtrlIp(Ipv4Address(srcCtrlIpStr.c_str()));
+        if (!srcNode) return;
+        
+        uint32_t srcId = srcNode->GetId();
+        m_topology[srcId].clear();
+        
+        // --- CRITICAL FIX FROM SUS CODE: DISTANCE CHECK ---
+        Ptr<MobilityModel> srcMob = srcNode->GetObject<MobilityModel>();
+
+        while (ss >> nbrCtrlIpStr) {
+            Ipv4Address nbrIp(nbrCtrlIpStr.c_str());
+            Ptr<Node> nbrNode = FindNodeByCtrlIp(nbrIp);
+            if (nbrNode) {
+                // Verify Distance (The "God Mode" sanity check)
+                Ptr<MobilityModel> nbrMob = nbrNode->GetObject<MobilityModel>();
+                double dist = srcMob->GetDistanceFrom(nbrMob);
+                
+                // If within safe range (180m), accept the link
+                if (dist <= 180.0) {
+                    m_topology[srcId].insert(nbrNode->GetId());
+                    m_topology[nbrNode->GetId()].insert(srcId);
+                }
+            }
+        }
+    }
+
+    void RecomputeRoutes() {
+        if (!g_sdnNodes) return;
+        
+        for (uint32_t i = 0; i < g_sdnNodes->GetN(); ++i) {
+            Ptr<Node> node = g_sdnNodes->Get(i);
+            uint32_t nodeId = node->GetId();
+            if (nodeId == 50) continue; 
+
+            // BFS Dijkstra
+            std::map<uint32_t, uint32_t> nextHop, parent;
+            std::queue<uint32_t> q; std::set<uint32_t> visited;
+            q.push(nodeId); visited.insert(nodeId); parent[nodeId] = nodeId;
+            
+            while(!q.empty()) {
+                uint32_t u = q.front(); q.pop();
+                for(uint32_t v : m_topology[u]) {
+                    if(visited.find(v) == visited.end()) {
+                        visited.insert(v); parent[v] = u; q.push(v);
+                    }
+                }
+            }
+            
+            for(uint32_t dst : visited) {
+                if (dst == nodeId) continue;
+                uint32_t curr = dst;
+                while(parent[curr] != nodeId) curr = parent[curr];
+                nextHop[dst] = curr;
+            }
+
+            if (nextHop.empty()) continue;
+            std::ostringstream ss;
+            for (auto const& [dstId, nhId] : nextHop) {
+                if (dstId == 50) continue;
+                // Convert Node IDs to DATA IPs for the route table
+                ss << GetNodeIpv4Address(g_sdnNodes->Get(dstId), 1) << " " << GetNodeIpv4Address(g_sdnNodes->Get(nhId), 1) << " ";
+            }
+            std::string msg = ss.str();
+            if (msg.empty()) continue;
+
+            Ptr<Packet> p = Create<Packet>((uint8_t*)msg.c_str(), msg.size());
+            Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+            s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0));
+            s->SendTo(p, 0, InetSocketAddress(GetNodeIpv4Address(node, 2), 10000));
+            s->Close();
+        }
+        m_routeEvent = Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
+    }
+
+    Ptr<Socket> m_recvSocket;
+    EventId m_routeEvent;
+    std::map<uint32_t, std::set<uint32_t>> m_topology;
+    uint32_t m_ctrlIfIndex;
+};
+
+
+// ============================================================================
+//                                MAIN
+// ============================================================================
+
+int main (int argc, char *argv[])
+{
+  std::string protocol = "AODV"; 
+  int speed = 10;
+  int runId = 1;
+  std::string traceFile = ""; 
+  std::string outputDir = "."; 
+  double simTime = 300.0;      
+  uint32_t numNodes = 50; 
+  bool enableNetAnim = false; 
+
+  CommandLine cmd;
+  cmd.AddValue ("protocol", "Protocol (AODV, DSDV, OLSR, SDN)", protocol);
+  cmd.AddValue ("speed", "Speed", speed);
+  cmd.AddValue ("runId", "Run ID", runId);
+  cmd.AddValue ("traceFile", "Trace file", traceFile);
+  cmd.AddValue ("outputDir", "Output Directory", outputDir);
+  cmd.AddValue ("netanim", "Enable NetAnim", enableNetAnim);
+  cmd.Parse (argc, argv);
+
+  if (traceFile.empty ()) {
+      traceFile = "scratch/mobility/mobility_" + std::to_string(speed) + ".tcl";
+  }
+  
+  std::stringstream ss;
+  ss << outputDir << "/result_" << protocol << "_" << speed << "_" << runId << ".xml";
+  std::string xmlFileName = ss.str();
+  
+  std::stringstream ssAnim;
+  ssAnim << outputDir << "/netanim_" << protocol << "_" << speed << "_" << runId << ".xml";
+  std::string animFileName = ssAnim.str();
+
+  RngSeedManager::SetSeed (3 + runId); 
+  RngSeedManager::SetRun (runId);
+
+  // --------------------------------------------------------------------------
+  //                        TRADITIONAL MODE
+  // --------------------------------------------------------------------------
+  if (protocol != "SDN") 
+  {
+      // ... (Same Traditional Mode Logic as before) ...
+      NS_LOG_UNCOND("Running Traditional Mode: " << protocol);
+      NodeContainer nodes; nodes.Create (numNodes);
+      Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
+      ns2.Install (nodes.Begin(), nodes.End());
+
+      WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211a);
+      YansWifiPhyHelper wifiPhy; YansWifiChannelHelper wifiChannel;
+      wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+      wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+      wifiPhy.SetChannel (wifiChannel.Create ());
+      wifiPhy.Set ("TxPowerStart", DoubleValue(16.0));
+      wifiPhy.Set ("TxPowerEnd", DoubleValue(16.0));
+      WifiMacHelper wifiMac; wifiMac.SetType ("ns3::AdhocWifiMac");
+      NetDeviceContainer devices = wifi.Install (wifiPhy, wifiMac, nodes);
+
+      Ipv4ListRoutingHelper list; InternetStackHelper stack;
+      if (protocol == "AODV") { AodvHelper aodv; list.Add (aodv, 100); }
+      else if (protocol == "DSDV") { DsdvHelper dsdv; list.Add (dsdv, 100); }
+      else if (protocol == "OLSR") { OlsrHelper olsr; list.Add (olsr, 100); }
+      stack.SetRoutingHelper (list);
+      stack.Install (nodes);
+
+      Ipv4AddressHelper address; address.SetBase ("10.1.1.0", "255.255.255.0");
+      Ipv4InterfaceContainer interfaces = address.Assign (devices);
+
+      uint16_t port = 9;
+      UdpEchoServerHelper server (port);
+      ApplicationContainer serverApps = server.Install (nodes.Get (0));
+      serverApps.Start (Seconds (1.0)); serverApps.Stop (Seconds (simTime));
+      UdpEchoClientHelper client (interfaces.GetAddress (0), port);
+      client.SetAttribute ("MaxPackets", UintegerValue (100000));
+      client.SetAttribute ("Interval", TimeValue (Seconds (0.25))); 
+      client.SetAttribute ("PacketSize", UintegerValue (1024));
+      ApplicationContainer clientApps = client.Install (nodes.Get (numNodes - 1));
+      clientApps.Start (Seconds (2.0)); clientApps.Stop (Seconds (simTime));
+
+      FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+      Simulator::Stop (Seconds (simTime)); Simulator::Run ();
+      monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
+      Simulator::Destroy ();
+  }
+  // --------------------------------------------------------------------------
+  //                              SDN MODE (HYBRID)
+  // --------------------------------------------------------------------------
+  else 
+  {
+      NS_LOG_UNCOND("Running SDN Mode (Hybrid: Reporting + Distance Check)");
+
+      NodeContainer vehicles; vehicles.Create(numNodes);
+      NodeContainer controller; controller.Create(1);
+      NodeContainer allNodes = NodeContainer(vehicles, controller);
+      g_sdnNodes = &allNodes;
+
+      Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
+      ns2.Install (vehicles.Begin(), vehicles.End());
+
+      MobilityHelper mobilityCtrl;
+      mobilityCtrl.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+      mobilityCtrl.Install(controller);
+      controller.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(500, 500, 0));
+
+      WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211a);
+      YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
+      chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+      chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+      chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(250.0));
+      phyData.SetChannel (chanData.Create ());
+      WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
+      NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
+
+      WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
+      YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
+      chanCtrl.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+      chanCtrl.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(2000.0));
+      phyCtrl.SetChannel (chanCtrl.Create ());
+      WifiMacHelper macCtrl; macCtrl.SetType ("ns3::AdhocWifiMac");
+      NetDeviceContainer devCtrlVeh = wifiCtrl.Install(phyCtrl, macCtrl, vehicles);
+      NetDeviceContainer devCtrlNode = wifiCtrl.Install(phyCtrl, macCtrl, controller);
+
+      InternetStackHelper stack;
+      Ipv4ListRoutingHelper list;
+      Ipv4StaticRoutingHelper staticRouting;
+      list.Add(staticRouting, 100); 
+      stack.SetRoutingHelper(list);
+      stack.Install(allNodes);
+
+      // ENABLE IP FORWARDING
+      for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+          vehicles.Get(i)->GetObject<Ipv4>()->SetAttribute("IpForward", BooleanValue(true));
+      }
+
+      Ipv4AddressHelper ipv4Data; ipv4Data.SetBase ("10.1.0.0", "255.255.0.0");
+      Ipv4InterfaceContainer ifData = ipv4Data.Assign(devicesData);
+
+      Ipv4AddressHelper ipv4Ctrl; ipv4Ctrl.SetBase ("10.2.0.0", "255.255.0.0");
+      Ipv4InterfaceContainer ifCtrlVeh = ipv4Ctrl.Assign(devCtrlVeh);
+      Ipv4InterfaceContainer ifCtrlNode = ipv4Ctrl.Assign(devCtrlNode);
+
+      Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
+      ctrlApp->SetCtrlIfIndex(1); 
+      controller.Get(0)->AddApplication(ctrlApp);
+      ctrlApp->SetStartTime(Seconds(0.1)); ctrlApp->SetStopTime(Seconds(simTime));
+      
+      Ipv4Address controllerIp = ifCtrlNode.GetAddress(0);
+      for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+          Ptr<VehicleSdnApp> app = CreateObject<VehicleSdnApp>();
+          app->Setup(controllerIp, 1, 2); 
+          vehicles.Get(i)->AddApplication(app);
+          app->SetStartTime(Seconds(0.5 + (i*0.01))); app->SetStopTime(Seconds(simTime));
+      }
+
+      uint16_t port = 9;
+      UdpEchoServerHelper server (port);
+      ApplicationContainer serverApps = server.Install (vehicles.Get (0));
+      serverApps.Start (Seconds (5.0)); serverApps.Stop (Seconds (simTime));
+
+      UdpEchoClientHelper client (ifData.GetAddress (0), port);
+      client.SetAttribute ("MaxPackets", UintegerValue (100000));
+      client.SetAttribute ("Interval", TimeValue (Seconds (0.25))); 
+      client.SetAttribute ("PacketSize", UintegerValue (1024));
+      ApplicationContainer clientApps = client.Install (vehicles.Get (numNodes - 1));
+      clientApps.Start (Seconds (6.0)); clientApps.Stop (Seconds (simTime));
+
+      FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+      
+      if (enableNetAnim) {
+          AnimationInterface anim(animFileName);
+          anim.SetMaxPktsPerTraceFile(999999999999); 
+          anim.EnablePacketMetadata(false); 
+          for(uint32_t i=0; i<vehicles.GetN(); ++i) anim.UpdateNodeColor(vehicles.Get(i), 0, 0, 255);
+          anim.UpdateNodeColor(controller.Get(0), 255, 0, 0);
+      }
+
+      Simulator::Stop (Seconds (simTime)); Simulator::Run ();
+      monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
+      Simulator::Destroy ();
+  }
+
+  return 0;
+}
