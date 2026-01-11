@@ -1,11 +1,3 @@
-/*
- * Final Comparison: SDN vs Traditional
- * HYBRID APPROACH (Best of Both Worlds):
- * 1. Uses VehicleSdnApp (Beacons + Reports) for REALISM.
- * 2. Uses Controller Distance Check (Logic from your working code) for RELIABILITY.
- * 3. Uses IP Forwarding & Route Purging for CORRECTNESS.
- */
-
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
@@ -57,7 +49,7 @@ Ptr<Node> FindNodeByCtrlIp(Ipv4Address ctrlIp) {
 // ============================================================================
 //                              SDN VEHICLE APP
 // ============================================================================
-// Restored: Sends Beacons and Reports (Realism)
+
 class VehicleSdnApp : public Application {
 public:
     static TypeId GetTypeId() {
@@ -86,8 +78,9 @@ private:
         m_ctrlRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveRoute, this));
 
         double jitter = (double)(GetNode()->GetId()) * 0.01; 
-        m_beaconEvent = Simulator::Schedule(Seconds(0.5 + jitter), &VehicleSdnApp::SendBeacon, this);
-        m_reportEvent = Simulator::Schedule(Seconds(1.0 + jitter), &VehicleSdnApp::SendReport, this);
+        // Start application
+        m_beaconEvent = Simulator::Schedule(Seconds(0.2 + jitter), &VehicleSdnApp::SendBeacon, this); // 0.5
+        m_reportEvent = Simulator::Schedule(Seconds(0.5 + jitter), &VehicleSdnApp::SendReport, this); // 1.0
     }
 
     virtual void StopApplication() {
@@ -101,7 +94,7 @@ private:
         std::string data = oss.str();
         Ptr<Packet> p = Create<Packet>((uint8_t*)data.c_str(), data.size());
         m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), 8888));
-        m_beaconEvent = Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendBeacon, this);
+        m_beaconEvent = Simulator::Schedule(Seconds(0.2), &VehicleSdnApp::SendBeacon, this); // 0.5
     }
 
     void ReceiveBeacon(Ptr<Socket> socket) {
@@ -127,7 +120,7 @@ private:
         s->Connect(InetSocketAddress(m_controllerIp, 9999));
         s->Send(pkt); s->Close();
         m_neighbors.clear();
-        m_reportEvent = Simulator::Schedule(Seconds(1.0), &VehicleSdnApp::SendReport, this);
+        m_reportEvent = Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendReport, this); // 1.0
     }
 
     // Purge old routes to fix the "Append" bug
@@ -135,10 +128,10 @@ private:
         for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
             Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
             if (route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255")) {
-                 if (route.GetDest().IsBroadcast()) continue; 
-                 if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
-                     staticRouting->RemoveRoute(i-1);
-                 }
+                if (route.GetDest().IsBroadcast()) continue; 
+                if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                    staticRouting->RemoveRoute(i-1);
+                }
             }
         }
     }
@@ -193,7 +186,7 @@ private:
         m_recvSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_recvSocket->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 9999));
         m_recvSocket->SetRecvCallback(MakeCallback(&SdnControllerApp::ReceiveReport, this));
-        m_routeEvent = Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
+        m_routeEvent = Simulator::Schedule(Seconds(0.1), &SdnControllerApp::RecomputeRoutes, this); // 1.0
     }
     virtual void StopApplication() { Simulator::Cancel(m_routeEvent); if(m_recvSocket) m_recvSocket->Close(); }
 
@@ -263,6 +256,7 @@ private:
             }
 
             if (nextHop.empty()) continue;
+
             std::ostringstream ss;
             for (auto const& [dstId, nhId] : nextHop) {
                 if (dstId == 50) continue;
@@ -272,13 +266,18 @@ private:
             std::string msg = ss.str();
             if (msg.empty()) continue;
 
-            Ptr<Packet> p = Create<Packet>((uint8_t*)msg.c_str(), msg.size());
-            Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-            s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0));
-            s->SendTo(p, 0, InetSocketAddress(GetNodeIpv4Address(node, 2), 10000));
-            s->Close();
+            Simulator::Schedule(Seconds(i * 0.005), &SdnControllerApp::SendRoutePacket, this, node, msg);
         }
-        m_routeEvent = Simulator::Schedule(Seconds(1.0), &SdnControllerApp::RecomputeRoutes, this);
+        m_routeEvent = Simulator::Schedule(Seconds(0.1), &SdnControllerApp::RecomputeRoutes, this); // 1.0 to 0.5 to 0.1
+    }
+
+    // New Helper Function to actually send the packet
+    void SendRoutePacket(Ptr<Node> targetNode, std::string msg) {
+        Ptr<Packet> p = Create<Packet>((uint8_t*)msg.c_str(), msg.size());
+        Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0));
+        s->SendTo(p, 0, InetSocketAddress(GetNodeIpv4Address(targetNode, 2), 10000));
+        s->Close();
     }
 
     Ptr<Socket> m_recvSocket;
