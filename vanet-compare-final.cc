@@ -26,6 +26,59 @@ NS_LOG_COMPONENT_DEFINE ("VanetCompareFinal");
 NodeContainer* g_sdnNodes = nullptr;
 
 // ============================================================================
+//                      CONFIGURATION CONSTANTS
+// ============================================================================
+// === TIMING PARAMETERS (seconds) ===
+const double BEACON_INTERVAL = 0.2;           // Vehicle beacon broadcast interval
+const double REPORT_INTERVAL = 0.25;          // Vehicle topology report to controller interval
+const double ROUTE_RECOMPUTE_INTERVAL = 0.25; // Controller route recomputation interval
+const double CONTROLLER_START_TIME = 0.2;    // When controller starts route computation
+const double JITTER_MULTIPLIER = 0.002;       // Per-node jitter to avoid synchronization
+
+// === DISTANCE THRESHOLDS (meters) ===
+const double VEHICLE_RANGE_THRESHOLD = 230.0; // Max distance for vehicle to accept route next-hop
+const double CONTROLLER_LINK_THRESHOLD = 210.0; // Max distance for controller to accept topology link
+const double WIFI_DATA_MAX_RANGE = 350.0;     // Data channel max transmission range
+const double WIFI_CTRL_MAX_RANGE = 2000.0;    // Control channel max transmission range (long-range)
+
+// === NETWORK INTERFACE INDICES ===
+const uint32_t DATA_IF_INDEX = 1;             // Data network interface index
+const uint32_t CTRL_IF_INDEX = 2;             // Control network interface index
+const uint32_t CTRL_NODE_IF_INDEX = 1;        // Controller node's control interface
+
+// === UDP PORTS ===
+const uint16_t BEACON_PORT = 8888;            // Broadcast beacon port
+const uint16_t CONTROLLER_REPORT_PORT = 9999; // Topology report receive port
+const uint16_t VEHICLE_ROUTE_PORT = 10000;    // Route update receive port
+const uint16_t DATA_APP_PORT = 9;             // Echo application port
+
+// === APPLICATION TIMING ===
+const double SERVER_START_TIME = 5.0;         // Echo server start time
+const double CLIENT_START_TIME = 10.0;        // Echo client start time
+const double VEHICLE_APP_START_OFFSET = 0.5;  // Base vehicle app start time
+const double VEHICLE_APP_STAGGER = 0.01;      // Per-node stagger for app start
+
+// === SCHEDULING OFFSETS ===
+const double CONTROLLER_SEND_OFFSET = 0.0005; // Per-node offset for sending routes from controller
+
+// === SPECIAL NODE IDs ===
+const uint32_t CONTROLLER_NODE_ID = 50;       // Fixed ID for SDN controller
+
+// === IP CONFIGURATION ===
+const char* DATA_NETWORK_PREFIX = "10.1.0.0";
+const char* DATA_NETWORK_MASK = "255.255.0.0";
+const char* CTRL_NETWORK_PREFIX = "10.2.0.0";
+const char* CTRL_NETWORK_MASK = "255.255.0.0";
+const char* CONTROLLER_POSITION_X = "500";
+const char* CONTROLLER_POSITION_Y = "500";
+const char* CONTROLLER_POSITION_Z = "0";
+
+// === APPLICATION PARAMETERS ===
+const uint32_t MAX_PACKETS = 100000;          // Max packets for echo client
+const double PACKET_INTERVAL = 0.1;           // Echo packet interval (seconds)
+const uint32_t PACKET_SIZE = 1024;            // Echo packet size (bytes)
+
+// ============================================================================
 //                          SDN HELPER FUNCTIONS
 // ============================================================================
 
@@ -56,7 +109,7 @@ public:
         static TypeId tid = TypeId("ns3::VehicleSdnApp").SetParent<Application>().AddConstructor<VehicleSdnApp>();
         return tid;
     }
-    VehicleSdnApp() : m_dataIfIndex(1), m_ctrlIfIndex(2) {}
+    VehicleSdnApp() : m_dataIfIndex(DATA_IF_INDEX), m_ctrlIfIndex(CTRL_IF_INDEX) {}
     void Setup(Ipv4Address controllerIp, uint32_t dataIfIndex, uint32_t ctrlIfIndex) {
         m_controllerIp = controllerIp; m_dataIfIndex = dataIfIndex; m_ctrlIfIndex = ctrlIfIndex;
     }
@@ -69,18 +122,18 @@ private:
 
         // Beacon RX on control interface (single persistent socket)
         m_beaconRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        m_beaconRx->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8888));
+        m_beaconRx->Bind(InetSocketAddress(Ipv4Address::GetAny(), BEACON_PORT));
         m_beaconRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveBeacon, this));
 
         // Control RX (Route Updates) - persistent
         m_ctrlRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        m_ctrlRx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 10000));
+        m_ctrlRx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), VEHICLE_ROUTE_PORT));
         m_ctrlRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveRoute, this));
 
-        double jitter = (double)(GetNode()->GetId()) * 0.002; 
+        double jitter = (double)(GetNode()->GetId()) * JITTER_MULTIPLIER; 
         // Aggressive timing: fast discovery to match 15m/s mobility
-        m_beaconEvent = Simulator::Schedule(Seconds(0.2 + jitter), &VehicleSdnApp::SendBeacon, this);
-        m_reportEvent = Simulator::Schedule(Seconds(0.25 + jitter), &VehicleSdnApp::SendReport, this);
+        m_beaconEvent = Simulator::Schedule(Seconds(BEACON_INTERVAL + jitter), &VehicleSdnApp::SendBeacon, this);
+        m_reportEvent = Simulator::Schedule(Seconds(REPORT_INTERVAL + jitter), &VehicleSdnApp::SendReport, this);
     }
 
     virtual void StopApplication() {
@@ -93,8 +146,8 @@ private:
         std::ostringstream oss; oss << GetNodeIpv4Address(GetNode(), m_ctrlIfIndex);
         std::string data = oss.str();
         Ptr<Packet> p = Create<Packet>((uint8_t*)data.c_str(), data.size());
-        m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), 8888));
-        m_beaconEvent = Simulator::Schedule(Seconds(0.2), &VehicleSdnApp::SendBeacon, this);
+        m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), BEACON_PORT));
+        m_beaconEvent = Simulator::Schedule(Seconds(BEACON_INTERVAL), &VehicleSdnApp::SendBeacon, this);
     }
 
     void ReceiveBeacon(Ptr<Socket> socket) {
@@ -117,10 +170,10 @@ private:
         Ptr<Packet> pkt = Create<Packet>((uint8_t*)data.c_str(), data.size());
         Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0)); 
-        s->Connect(InetSocketAddress(m_controllerIp, 9999));
+        s->Connect(InetSocketAddress(m_controllerIp, CONTROLLER_REPORT_PORT));
         s->Send(pkt); s->Close();
         m_neighbors.clear();
-        m_reportEvent = Simulator::Schedule(Seconds(0.25), &VehicleSdnApp::SendReport, this);
+        m_reportEvent = Simulator::Schedule(Seconds(REPORT_INTERVAL), &VehicleSdnApp::SendReport, this);
     }
 
     // Purge old routes to fix the "Append" bug
@@ -207,12 +260,12 @@ private:
                     }
                 }
                 
-                // Distance check: skip if next-hop is now out of range (230m strict threshold)
+                // Distance check: skip if next-hop is now out of range
                 if (nhNode) {
                     Ptr<MobilityModel> myMob = myNode->GetObject<MobilityModel>();
                     Ptr<MobilityModel> nhMob = nhNode->GetObject<MobilityModel>();
                     double dist = myMob->GetDistanceFrom(nhMob);
-                    if (dist > 230.0) {
+                    if (dist > VEHICLE_RANGE_THRESHOLD) {
                         // Next-hop too far; skip this route to avoid blackhole
                         continue;
                     }
@@ -250,15 +303,15 @@ public:
         static TypeId tid = TypeId("ns3::SdnControllerApp").SetParent<Application>().AddConstructor<SdnControllerApp>();
         return tid;
     }
-    SdnControllerApp() : m_ctrlIfIndex(1) {}
+    SdnControllerApp() : m_ctrlIfIndex(CTRL_NODE_IF_INDEX) {}
     void SetCtrlIfIndex(uint32_t idx) { m_ctrlIfIndex = idx; }
 
 private:
     virtual void StartApplication() {
         m_recvSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        m_recvSocket->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 9999));
+        m_recvSocket->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), CONTROLLER_REPORT_PORT));
         m_recvSocket->SetRecvCallback(MakeCallback(&SdnControllerApp::ReceiveReport, this));
-        m_routeEvent = Simulator::Schedule(Seconds(0.2), &SdnControllerApp::RecomputeRoutes, this); // Start early for initial topology discovery
+        m_routeEvent = Simulator::Schedule(Seconds(CONTROLLER_START_TIME), &SdnControllerApp::RecomputeRoutes, this); // Start early for initial topology discovery
     }
     virtual void StopApplication() { Simulator::Cancel(m_routeEvent); if(m_recvSocket) m_recvSocket->Close(); }
 
@@ -289,8 +342,8 @@ private:
                 Ptr<MobilityModel> nbrMob = nbrNode->GetObject<MobilityModel>();
                 double dist = srcMob->GetDistanceFrom(nbrMob);
                 
-                // If within safe range (210m strict), accept the link
-                if (dist <= 210.0) {
+                // If within safe range, accept the link
+                if (dist <= CONTROLLER_LINK_THRESHOLD) {
                     m_topology[srcId].insert(nbrNode->GetId());
                     m_topology[nbrNode->GetId()].insert(srcId);
                 }
@@ -304,7 +357,7 @@ private:
         // Only recompute if topology *actually* changed (not just order)
         std::map<uint32_t, std::set<uint32_t>> sortedTopo = m_topology;
         if (m_lastTopology == sortedTopo) {
-            m_routeEvent = Simulator::Schedule(Seconds(0.25), &SdnControllerApp::RecomputeRoutes, this);
+            m_routeEvent = Simulator::Schedule(Seconds(ROUTE_RECOMPUTE_INTERVAL), &SdnControllerApp::RecomputeRoutes, this);
             return;
         }
         m_lastTopology = sortedTopo;
@@ -312,7 +365,7 @@ private:
         for (uint32_t i = 0; i < g_sdnNodes->GetN(); ++i) {
             Ptr<Node> node = g_sdnNodes->Get(i);
             uint32_t nodeId = node->GetId();
-            if (nodeId == 50) continue; 
+            if (nodeId == CONTROLLER_NODE_ID) continue; 
 
             // BFS Dijkstra
             std::map<uint32_t, uint32_t> nextHop, parent;
@@ -339,16 +392,16 @@ private:
 
             std::ostringstream ss;
             for (auto const& [dstId, nhId] : nextHop) {
-                if (dstId == 50) continue;
+                if (dstId == CONTROLLER_NODE_ID) continue;
                 // Convert Node IDs to DATA IPs for the route table
                 ss << GetNodeIpv4Address(g_sdnNodes->Get(dstId), 1) << " " << GetNodeIpv4Address(g_sdnNodes->Get(nhId), 1) << " ";
             }
             std::string msg = ss.str();
             if (msg.empty()) continue;
 
-            Simulator::Schedule(Seconds(i * 0.0005), &SdnControllerApp::SendRoutePacket, this, node, msg);
+            Simulator::Schedule(Seconds(i * CONTROLLER_SEND_OFFSET), &SdnControllerApp::SendRoutePacket, this, node, msg);
         }
-        m_routeEvent = Simulator::Schedule(Seconds(0.25), &SdnControllerApp::RecomputeRoutes, this);
+        m_routeEvent = Simulator::Schedule(Seconds(ROUTE_RECOMPUTE_INTERVAL), &SdnControllerApp::RecomputeRoutes, this);
     }
 
     // New Helper Function to actually send the packet
@@ -356,7 +409,7 @@ private:
         Ptr<Packet> p = Create<Packet>((uint8_t*)msg.c_str(), msg.size());
         Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         s->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0));
-        s->SendTo(p, 0, InetSocketAddress(GetNodeIpv4Address(targetNode, 2), 10000));
+        s->SendTo(p, 0, InetSocketAddress(GetNodeIpv4Address(targetNode, CTRL_IF_INDEX), VEHICLE_ROUTE_PORT));
         s->Close();
     }
 
@@ -428,7 +481,7 @@ int main (int argc, char *argv[])
       YansWifiPhyHelper wifiPhy; YansWifiChannelHelper wifiChannel;
       wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
       wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-      wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(350.0));
+      wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
       wifiPhy.SetChannel (wifiChannel.Create ());
       wifiPhy.Set ("TxPowerStart", DoubleValue(20.0));
       wifiPhy.Set ("TxPowerEnd", DoubleValue(20.0));
@@ -446,16 +499,16 @@ int main (int argc, char *argv[])
       Ipv4AddressHelper address; address.SetBase ("10.1.1.0", "255.255.255.0");
       Ipv4InterfaceContainer interfaces = address.Assign (devices);
 
-      uint16_t port = 9;
+      uint16_t port = DATA_APP_PORT;
       UdpEchoServerHelper server (port);
       ApplicationContainer serverApps = server.Install (nodes.Get (0));
-      serverApps.Start (Seconds (5.0)); serverApps.Stop (Seconds (simTime));
+      serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
       UdpEchoClientHelper client (interfaces.GetAddress (0), port);
-      client.SetAttribute ("MaxPackets", UintegerValue (100000));
-      client.SetAttribute ("Interval", TimeValue (Seconds (0.1))); 
-      client.SetAttribute ("PacketSize", UintegerValue (1024));
+      client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
+      client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
+      client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
       ApplicationContainer clientApps = client.Install (nodes.Get (numNodes - 1));
-      clientApps.Start (Seconds (10.0)); clientApps.Stop (Seconds (simTime));
+      clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
 
       FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
       Simulator::Stop (Seconds (simTime)); Simulator::Run ();
@@ -491,7 +544,7 @@ int main (int argc, char *argv[])
     YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
     chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
     chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-    chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(350.0));
+    chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
     phyData.SetChannel (chanData.Create ());
     phyData.Set("TxPowerStart", DoubleValue(20.0));
     phyData.Set("TxPowerEnd", DoubleValue(20.0));
@@ -502,7 +555,7 @@ int main (int argc, char *argv[])
       WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
       YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
       chanCtrl.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-      chanCtrl.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(2000.0));
+      chanCtrl.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_CTRL_MAX_RANGE));
       phyCtrl.SetChannel (chanCtrl.Create ());
       WifiMacHelper macCtrl; macCtrl.SetType ("ns3::AdhocWifiMac");
       NetDeviceContainer devCtrlVeh = wifiCtrl.Install(phyCtrl, macCtrl, vehicles);
@@ -520,37 +573,37 @@ int main (int argc, char *argv[])
           vehicles.Get(i)->GetObject<Ipv4>()->SetAttribute("IpForward", BooleanValue(true));
       }
 
-      Ipv4AddressHelper ipv4Data; ipv4Data.SetBase ("10.1.0.0", "255.255.0.0");
+      Ipv4AddressHelper ipv4Data; ipv4Data.SetBase (DATA_NETWORK_PREFIX, DATA_NETWORK_MASK);
       Ipv4InterfaceContainer ifData = ipv4Data.Assign(devicesData);
 
-      Ipv4AddressHelper ipv4Ctrl; ipv4Ctrl.SetBase ("10.2.0.0", "255.255.0.0");
+      Ipv4AddressHelper ipv4Ctrl; ipv4Ctrl.SetBase (CTRL_NETWORK_PREFIX, CTRL_NETWORK_MASK);
       Ipv4InterfaceContainer ifCtrlVeh = ipv4Ctrl.Assign(devCtrlVeh);
       Ipv4InterfaceContainer ifCtrlNode = ipv4Ctrl.Assign(devCtrlNode);
 
       Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
-      ctrlApp->SetCtrlIfIndex(1); 
+      ctrlApp->SetCtrlIfIndex(CTRL_NODE_IF_INDEX); 
       controller.Get(0)->AddApplication(ctrlApp);
       ctrlApp->SetStartTime(Seconds(0.1)); ctrlApp->SetStopTime(Seconds(simTime));
       
       Ipv4Address controllerIp = ifCtrlNode.GetAddress(0);
       for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
           Ptr<VehicleSdnApp> app = CreateObject<VehicleSdnApp>();
-          app->Setup(controllerIp, 1, 2); 
+          app->Setup(controllerIp, DATA_IF_INDEX, CTRL_IF_INDEX); 
           vehicles.Get(i)->AddApplication(app);
-          app->SetStartTime(Seconds(0.5 + (i*0.01))); app->SetStopTime(Seconds(simTime));
+          app->SetStartTime(Seconds(VEHICLE_APP_START_OFFSET + (i*VEHICLE_APP_STAGGER))); app->SetStopTime(Seconds(simTime));
       }
 
-      uint16_t port = 9;
+      uint16_t port = DATA_APP_PORT;
       UdpEchoServerHelper server (port);
       ApplicationContainer serverApps = server.Install (vehicles.Get (0));
-      serverApps.Start (Seconds (5.0)); serverApps.Stop (Seconds (simTime));
+      serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
 
       UdpEchoClientHelper client (ifData.GetAddress (0), port);
-      client.SetAttribute ("MaxPackets", UintegerValue (100000));
-      client.SetAttribute ("Interval", TimeValue (Seconds (0.1))); 
-      client.SetAttribute ("PacketSize", UintegerValue (1024));
+      client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
+      client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
+      client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
       ApplicationContainer clientApps = client.Install (vehicles.Get (numNodes - 1));
-      clientApps.Start (Seconds (10.0)); clientApps.Stop (Seconds (simTime));
+      clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
 
       FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
       
