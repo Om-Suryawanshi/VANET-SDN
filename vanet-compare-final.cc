@@ -62,25 +62,25 @@ public:
     }
 private:
     virtual void StartApplication() {
-        // Beacon TX (Data Interface)
+        // Beacon TX on control interface (persistent socket, no churn)
         m_beaconTx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_beaconTx->SetAllowBroadcast(true);
-        m_beaconTx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_dataIfIndex), 0));
+        m_beaconTx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 0));
 
-        // Beacon RX
+        // Beacon RX on control interface (single persistent socket)
         m_beaconRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_beaconRx->Bind(InetSocketAddress(Ipv4Address::GetAny(), 8888));
         m_beaconRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveBeacon, this));
 
-        // Control RX (Route Updates)
+        // Control RX (Route Updates) - persistent
         m_ctrlRx = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_ctrlRx->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 10000));
         m_ctrlRx->SetRecvCallback(MakeCallback(&VehicleSdnApp::ReceiveRoute, this));
 
-        double jitter = (double)(GetNode()->GetId()) * 0.01; 
-        // Start application
-        m_beaconEvent = Simulator::Schedule(Seconds(0.2 + jitter), &VehicleSdnApp::SendBeacon, this); // 0.5
-        m_reportEvent = Simulator::Schedule(Seconds(0.5 + jitter), &VehicleSdnApp::SendReport, this); // 1.0
+        double jitter = (double)(GetNode()->GetId()) * 0.002; 
+        // Aggressive timing: fast discovery to match 15m/s mobility
+        m_beaconEvent = Simulator::Schedule(Seconds(0.2 + jitter), &VehicleSdnApp::SendBeacon, this);
+        m_reportEvent = Simulator::Schedule(Seconds(0.25 + jitter), &VehicleSdnApp::SendReport, this);
     }
 
     virtual void StopApplication() {
@@ -89,12 +89,12 @@ private:
     }
 
     void SendBeacon() {
-        // Broadcast Control IP (so neighbor knows who to report)
+        // Reuse persistent control-intf beacon socket to avoid churn
         std::ostringstream oss; oss << GetNodeIpv4Address(GetNode(), m_ctrlIfIndex);
         std::string data = oss.str();
         Ptr<Packet> p = Create<Packet>((uint8_t*)data.c_str(), data.size());
         m_beaconTx->SendTo(p, 0, InetSocketAddress(Ipv4Address("255.255.255.255"), 8888));
-        m_beaconEvent = Simulator::Schedule(Seconds(0.2), &VehicleSdnApp::SendBeacon, this); // 0.5
+        m_beaconEvent = Simulator::Schedule(Seconds(0.2), &VehicleSdnApp::SendBeacon, this);
     }
 
     void ReceiveBeacon(Ptr<Socket> socket) {
@@ -120,7 +120,7 @@ private:
         s->Connect(InetSocketAddress(m_controllerIp, 9999));
         s->Send(pkt); s->Close();
         m_neighbors.clear();
-        m_reportEvent = Simulator::Schedule(Seconds(0.5), &VehicleSdnApp::SendReport, this); // 1.0
+        m_reportEvent = Simulator::Schedule(Seconds(0.25), &VehicleSdnApp::SendReport, this);
     }
 
     // Purge old routes to fix the "Append" bug
@@ -154,13 +154,83 @@ private:
         }
         if (!staticRouting) return;
 
-        PurgeSDNRoutes(staticRouting);
-
+        // Incremental update: only remove/add if next-hop actually changed
+        std::map<Ipv4Address, Ipv4Address> newRoutes; // dst -> nextHop
         std::string dstStr, nhStr;
         while (ss >> dstStr >> nhStr) {
             if (dstStr.find('.') == std::string::npos) continue;
-            // Routes are installed for DATA IPs on Interface 1 (m_dataIfIndex)
-            staticRouting->AddHostRouteTo(Ipv4Address(dstStr.c_str()), Ipv4Address(nhStr.c_str()), m_dataIfIndex, 0);
+            newRoutes[Ipv4Address(dstStr.c_str())] = Ipv4Address(nhStr.c_str());
+        }
+
+        // Remove routes that disappeared from the controller update
+        for (auto it = m_cachedRoutes.begin(); it != m_cachedRoutes.end(); ) {
+            if (newRoutes.find(it->first) == newRoutes.end()) {
+                Ipv4Address dst = it->first;
+                for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+                    Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+                    if (route.GetDest() == dst &&
+                        route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
+                        route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                        staticRouting->RemoveRoute(i-1);
+                        break;
+                    }
+                }
+                it = m_cachedRoutes.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Compare with cached routes and only update if changed
+        for (auto& [dst, nh] : newRoutes) {
+            auto it = m_cachedRoutes.find(dst);
+            if (it == m_cachedRoutes.end() || it->second != nh) {
+                // Verify next-hop is still in range before installing route
+                Ptr<Node> myNode = GetNode();
+                Ptr<Node> nhNode = nullptr;
+                
+                // Check cache first for O(1) lookup
+                auto cacheIt = m_ipToNodeCache.find(nh);
+                if (cacheIt != m_ipToNodeCache.end()) {
+                    nhNode = cacheIt->second;
+                } else if (g_sdnNodes) {
+                    // Build cache on-demand (first lookup only)
+                    for (uint32_t i = 0; i < g_sdnNodes->GetN(); ++i) {
+                        Ipv4Address dataIp = GetNodeIpv4Address(g_sdnNodes->Get(i), 1);
+                        if (dataIp != Ipv4Address::GetZero()) {
+                            m_ipToNodeCache[dataIp] = g_sdnNodes->Get(i);
+                        }
+                    }
+                    cacheIt = m_ipToNodeCache.find(nh);
+                    if (cacheIt != m_ipToNodeCache.end()) {
+                        nhNode = cacheIt->second;
+                    }
+                }
+                
+                // Distance check: skip if next-hop is now out of range (230m strict threshold)
+                if (nhNode) {
+                    Ptr<MobilityModel> myMob = myNode->GetObject<MobilityModel>();
+                    Ptr<MobilityModel> nhMob = nhNode->GetObject<MobilityModel>();
+                    double dist = myMob->GetDistanceFrom(nhMob);
+                    if (dist > 230.0) {
+                        // Next-hop too far; skip this route to avoid blackhole
+                        continue;
+                    }
+                }
+                
+                // Route is new or next-hop changed; remove old and add new
+                for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+                    Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+                    if (route.GetDest() == dst && 
+                        route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
+                        route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                        staticRouting->RemoveRoute(i-1);
+                        break;
+                    }
+                }
+                staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+                m_cachedRoutes[dst] = nh;
+            }
         }
     }
 
@@ -168,6 +238,8 @@ private:
     Ipv4Address m_controllerIp;
     uint32_t m_dataIfIndex, m_ctrlIfIndex;
     std::set<Ipv4Address> m_neighbors;
+    std::map<Ipv4Address, Ipv4Address> m_cachedRoutes; // dst -> nextHop cache
+    std::map<Ipv4Address, Ptr<Node>> m_ipToNodeCache; // IP -> Node lookup cache
     EventId m_beaconEvent, m_reportEvent;
 };
 
@@ -186,7 +258,7 @@ private:
         m_recvSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_recvSocket->Bind(InetSocketAddress(GetNodeIpv4Address(GetNode(), m_ctrlIfIndex), 9999));
         m_recvSocket->SetRecvCallback(MakeCallback(&SdnControllerApp::ReceiveReport, this));
-        m_routeEvent = Simulator::Schedule(Seconds(0.1), &SdnControllerApp::RecomputeRoutes, this); // 1.0
+        m_routeEvent = Simulator::Schedule(Seconds(0.2), &SdnControllerApp::RecomputeRoutes, this); // Start early for initial topology discovery
     }
     virtual void StopApplication() { Simulator::Cancel(m_routeEvent); if(m_recvSocket) m_recvSocket->Close(); }
 
@@ -217,8 +289,8 @@ private:
                 Ptr<MobilityModel> nbrMob = nbrNode->GetObject<MobilityModel>();
                 double dist = srcMob->GetDistanceFrom(nbrMob);
                 
-                // If within safe range (180m), accept the link
-                if (dist <= 180.0) {
+                // If within safe range (210m strict), accept the link
+                if (dist <= 210.0) {
                     m_topology[srcId].insert(nbrNode->GetId());
                     m_topology[nbrNode->GetId()].insert(srcId);
                 }
@@ -228,6 +300,14 @@ private:
 
     void RecomputeRoutes() {
         if (!g_sdnNodes) return;
+        
+        // Only recompute if topology *actually* changed (not just order)
+        std::map<uint32_t, std::set<uint32_t>> sortedTopo = m_topology;
+        if (m_lastTopology == sortedTopo) {
+            m_routeEvent = Simulator::Schedule(Seconds(0.25), &SdnControllerApp::RecomputeRoutes, this);
+            return;
+        }
+        m_lastTopology = sortedTopo;
         
         for (uint32_t i = 0; i < g_sdnNodes->GetN(); ++i) {
             Ptr<Node> node = g_sdnNodes->Get(i);
@@ -266,9 +346,9 @@ private:
             std::string msg = ss.str();
             if (msg.empty()) continue;
 
-            Simulator::Schedule(Seconds(i * 0.005), &SdnControllerApp::SendRoutePacket, this, node, msg);
+            Simulator::Schedule(Seconds(i * 0.0005), &SdnControllerApp::SendRoutePacket, this, node, msg);
         }
-        m_routeEvent = Simulator::Schedule(Seconds(0.1), &SdnControllerApp::RecomputeRoutes, this); // 1.0 to 0.5 to 0.1
+        m_routeEvent = Simulator::Schedule(Seconds(0.25), &SdnControllerApp::RecomputeRoutes, this);
     }
 
     // New Helper Function to actually send the packet
@@ -282,7 +362,7 @@ private:
 
     Ptr<Socket> m_recvSocket;
     EventId m_routeEvent;
-    std::map<uint32_t, std::set<uint32_t>> m_topology;
+    std::map<uint32_t, std::set<uint32_t>> m_topology, m_lastTopology;
     uint32_t m_ctrlIfIndex;
 };
 
@@ -298,7 +378,7 @@ int main (int argc, char *argv[])
   int runId = 1;
   std::string traceFile = ""; 
   std::string outputDir = "."; 
-  double simTime = 300.0;      
+  double simTime = 60.0;      // Change to 60 for quick res
   uint32_t numNodes = 50; 
   bool enableNetAnim = false; 
 
@@ -333,17 +413,26 @@ int main (int argc, char *argv[])
   {
       // ... (Same Traditional Mode Logic as before) ...
       NS_LOG_UNCOND("Running Traditional Mode: " << protocol);
+      
+      // Configure RTS/CTS BEFORE creating WiFi
+      Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
+      
       NodeContainer nodes; nodes.Create (numNodes);
       Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
       ns2.Install (nodes.Begin(), nodes.End());
 
-      WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211a);
+      WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211p);
+      wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                             "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
+                             "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
       YansWifiPhyHelper wifiPhy; YansWifiChannelHelper wifiChannel;
       wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
       wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+      wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(350.0));
       wifiPhy.SetChannel (wifiChannel.Create ());
-      wifiPhy.Set ("TxPowerStart", DoubleValue(16.0));
-      wifiPhy.Set ("TxPowerEnd", DoubleValue(16.0));
+      wifiPhy.Set ("TxPowerStart", DoubleValue(20.0));
+      wifiPhy.Set ("TxPowerEnd", DoubleValue(20.0));
+      wifiPhy.Set("ChannelWidth", UintegerValue(10));
       WifiMacHelper wifiMac; wifiMac.SetType ("ns3::AdhocWifiMac");
       NetDeviceContainer devices = wifi.Install (wifiPhy, wifiMac, nodes);
 
@@ -360,13 +449,13 @@ int main (int argc, char *argv[])
       uint16_t port = 9;
       UdpEchoServerHelper server (port);
       ApplicationContainer serverApps = server.Install (nodes.Get (0));
-      serverApps.Start (Seconds (1.0)); serverApps.Stop (Seconds (simTime));
+      serverApps.Start (Seconds (5.0)); serverApps.Stop (Seconds (simTime));
       UdpEchoClientHelper client (interfaces.GetAddress (0), port);
       client.SetAttribute ("MaxPackets", UintegerValue (100000));
-      client.SetAttribute ("Interval", TimeValue (Seconds (0.25))); 
+      client.SetAttribute ("Interval", TimeValue (Seconds (0.1))); 
       client.SetAttribute ("PacketSize", UintegerValue (1024));
       ApplicationContainer clientApps = client.Install (nodes.Get (numNodes - 1));
-      clientApps.Start (Seconds (2.0)); clientApps.Stop (Seconds (simTime));
+      clientApps.Start (Seconds (10.0)); clientApps.Stop (Seconds (simTime));
 
       FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
       Simulator::Stop (Seconds (simTime)); Simulator::Run ();
@@ -393,14 +482,22 @@ int main (int argc, char *argv[])
       mobilityCtrl.Install(controller);
       controller.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(500, 500, 0));
 
-      WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211a);
-      YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
-      chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-      chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-      chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(250.0));
-      phyData.SetChannel (chanData.Create ());
-      WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
-      NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
+    WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211p);
+    // Higher rate for better throughput: 12 Mbps on 10 MHz channel
+    wifiData.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                           "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
+                           "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
+    Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
+    YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
+    chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+    chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+    chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(350.0));
+    phyData.SetChannel (chanData.Create ());
+    phyData.Set("TxPowerStart", DoubleValue(20.0));
+    phyData.Set("TxPowerEnd", DoubleValue(20.0));
+    phyData.Set("ChannelWidth", UintegerValue(10));
+    WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
+    NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
 
       WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
       YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
@@ -450,10 +547,10 @@ int main (int argc, char *argv[])
 
       UdpEchoClientHelper client (ifData.GetAddress (0), port);
       client.SetAttribute ("MaxPackets", UintegerValue (100000));
-      client.SetAttribute ("Interval", TimeValue (Seconds (0.25))); 
+      client.SetAttribute ("Interval", TimeValue (Seconds (0.1))); 
       client.SetAttribute ("PacketSize", UintegerValue (1024));
       ApplicationContainer clientApps = client.Install (vehicles.Get (numNodes - 1));
-      clientApps.Start (Seconds (6.0)); clientApps.Stop (Seconds (simTime));
+      clientApps.Start (Seconds (10.0)); clientApps.Stop (Seconds (simTime));
 
       FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
       
