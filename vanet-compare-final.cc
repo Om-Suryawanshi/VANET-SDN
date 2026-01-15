@@ -18,12 +18,59 @@
 #include <queue>
 #include <string>
 #include <sstream>
+#include <fstream> // REQUIRED FOR CSV OUTPUT
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE ("VanetCompareFinal");
 
 NodeContainer* g_sdnNodes = nullptr;
+
+// Global variables for failure simulation
+double g_failureStartTime = -1.0;  // -1 = no failure
+double g_failureDuration = 0.0;
+
+// ============================================================================
+//                      PDR MONITORING & GRAPHING
+// ============================================================================
+uint32_t g_pdrTxCount = 0;
+uint32_t g_pdrRxCount = 0;
+
+// Callback: Packet Sent by Client
+void MonitorTxCallback(Ptr<const Packet> p) {
+    g_pdrTxCount++;
+}
+
+// Callback: Packet Received by Server
+void MonitorRxCallback(Ptr<const Packet> p) {
+    g_pdrRxCount++;
+}
+
+// Function: Write PDR to CSV every second
+void RecordPdrPerSecond(std::string filename) {
+    static std::ofstream file;
+    static double currentTime = 0;
+
+    if (!file.is_open()) {
+        file.open(filename.c_str(), std::ios::out);
+        file << "Time,PDR,Tx,Rx" << std::endl; // CSV Header
+    }
+
+    double pdr = 0.0;
+    if (g_pdrTxCount > 0) {
+        pdr = (double)g_pdrRxCount / g_pdrTxCount * 100.0;
+    }
+
+    // Log the data for this second
+    file << currentTime << "," << pdr << "," << g_pdrTxCount << "," << g_pdrRxCount << std::endl;
+
+    // Reset counters for the next window
+    g_pdrTxCount = 0;
+    g_pdrRxCount = 0;
+    currentTime += 1.0;
+
+    Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, filename);
+}
 
 // ============================================================================
 //                      CONFIGURATION CONSTANTS
@@ -32,14 +79,14 @@ NodeContainer* g_sdnNodes = nullptr;
 const double BEACON_INTERVAL = 0.2;           // Vehicle beacon broadcast interval
 const double REPORT_INTERVAL = 0.25;          // Vehicle topology report to controller interval
 const double ROUTE_RECOMPUTE_INTERVAL = 0.25; // Controller route recomputation interval
-const double CONTROLLER_START_TIME = 0.2;    // When controller starts route computation
+const double CONTROLLER_START_TIME = 0.2;     // When controller starts route computation
 const double JITTER_MULTIPLIER = 0.002;       // Per-node jitter to avoid synchronization
 
 // === DISTANCE THRESHOLDS (meters) ===
-const double VEHICLE_RANGE_THRESHOLD = 230.0; // Max distance for vehicle to accept route next-hop
+const double VEHICLE_RANGE_THRESHOLD = 230.0;   // Max distance for vehicle to accept route next-hop
 const double CONTROLLER_LINK_THRESHOLD = 210.0; // Max distance for controller to accept topology link
-const double WIFI_DATA_MAX_RANGE = 350.0;     // Data channel max transmission range
-const double WIFI_CTRL_MAX_RANGE = 2000.0;    // Control channel max transmission range (long-range)
+const double WIFI_DATA_MAX_RANGE = 350.0;       // Data channel max transmission range
+const double WIFI_CTRL_MAX_RANGE = 2000.0;      // Control channel max transmission range (long-range)
 
 // === NETWORK INTERFACE INDICES ===
 const uint32_t DATA_IF_INDEX = 1;             // Data network interface index
@@ -64,14 +111,16 @@ const double CONTROLLER_SEND_OFFSET = 0.0005; // Per-node offset for sending rou
 // === SPECIAL NODE IDs ===
 const uint32_t CONTROLLER_NODE_ID = 50;       // Fixed ID for SDN controller
 
+// === FAILURE RECOVERY CONFIGURATION ===
+const double CONTROLLER_TIMEOUT = 2.0;        // Seconds without controller response = failure
+const double HEARTBEAT_CHECK_INTERVAL = 0.5;  // How often to check controller connectivity
+const std::string FALLBACK_PROTOCOL = "AODV"; // Fallback protocol: "AODV" or "OLSR"
+
 // === IP CONFIGURATION ===
 const char* DATA_NETWORK_PREFIX = "10.1.0.0";
 const char* DATA_NETWORK_MASK = "255.255.0.0";
 const char* CTRL_NETWORK_PREFIX = "10.2.0.0";
 const char* CTRL_NETWORK_MASK = "255.255.0.0";
-const char* CONTROLLER_POSITION_X = "500";
-const char* CONTROLLER_POSITION_Y = "500";
-const char* CONTROLLER_POSITION_Z = "0";
 
 // === APPLICATION PARAMETERS ===
 const uint32_t MAX_PACKETS = 100000;          // Max packets for echo client
@@ -109,9 +158,10 @@ public:
         static TypeId tid = TypeId("ns3::VehicleSdnApp").SetParent<Application>().AddConstructor<VehicleSdnApp>();
         return tid;
     }
-    VehicleSdnApp() : m_dataIfIndex(DATA_IF_INDEX), m_ctrlIfIndex(CTRL_IF_INDEX) {}
+    VehicleSdnApp() : m_dataIfIndex(DATA_IF_INDEX), m_ctrlIfIndex(CTRL_IF_INDEX), m_usingSdnRouting(true) {}
     void Setup(Ipv4Address controllerIp, uint32_t dataIfIndex, uint32_t ctrlIfIndex) {
         m_controllerIp = controllerIp; m_dataIfIndex = dataIfIndex; m_ctrlIfIndex = ctrlIfIndex;
+        m_lastControllerContact = Simulator::Now();
     }
 private:
     virtual void StartApplication() {
@@ -134,10 +184,13 @@ private:
         // Aggressive timing: fast discovery to match 15m/s mobility
         m_beaconEvent = Simulator::Schedule(Seconds(BEACON_INTERVAL + jitter), &VehicleSdnApp::SendBeacon, this);
         m_reportEvent = Simulator::Schedule(Seconds(REPORT_INTERVAL + jitter), &VehicleSdnApp::SendReport, this);
+        
+        // Start controller connectivity monitoring for failure recovery
+        m_heartbeatEvent = Simulator::Schedule(Seconds(HEARTBEAT_CHECK_INTERVAL), &VehicleSdnApp::CheckControllerConnectivity, this);
     }
 
     virtual void StopApplication() {
-        Simulator::Cancel(m_beaconEvent); Simulator::Cancel(m_reportEvent);
+        Simulator::Cancel(m_beaconEvent); Simulator::Cancel(m_reportEvent); Simulator::Cancel(m_heartbeatEvent);
         if(m_beaconTx) m_beaconTx->Close(); if(m_beaconRx) m_beaconRx->Close(); if(m_ctrlRx) m_ctrlRx->Close();
     }
 
@@ -176,12 +229,14 @@ private:
         m_reportEvent = Simulator::Schedule(Seconds(REPORT_INTERVAL), &VehicleSdnApp::SendReport, this);
     }
 
-    // Purge old routes to fix the "Append" bug
+    // UPDATED: Safely remove SDN routes to allow Fallback Protocol to take over
     void PurgeSDNRoutes(Ptr<Ipv4StaticRouting> staticRouting) {
+        // Iterate backwards to safe delete
         for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
             Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+            
+            // Remove only specific host routes to data network
             if (route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255")) {
-                if (route.GetDest().IsBroadcast()) continue; 
                 if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
                     staticRouting->RemoveRoute(i-1);
                 }
@@ -192,6 +247,17 @@ private:
     void ReceiveRoute(Ptr<Socket> socket) {
         Address from; Ptr<Packet> pkt = socket->RecvFrom(from);
         if (pkt->GetSize() == 0) return;
+        
+        // Update last contact time - controller is alive!
+        m_lastControllerContact = Simulator::Now();
+        
+        // If we were using fallback, switch back to SDN
+        if (!m_usingSdnRouting) {
+            NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node " << GetNode()->GetId() 
+                          << ": Controller reconnected! Switching back to SDN routing");
+            SwitchToSdnRouting();
+        }
+        
         std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0); pkt->CopyData(buffer.data(), pkt->GetSize());
         std::stringstream ss((char*)buffer.data());
         
@@ -219,6 +285,7 @@ private:
         for (auto it = m_cachedRoutes.begin(); it != m_cachedRoutes.end(); ) {
             if (newRoutes.find(it->first) == newRoutes.end()) {
                 Ipv4Address dst = it->first;
+                // Safe removal
                 for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
                     Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
                     if (route.GetDest() == dst &&
@@ -287,13 +354,66 @@ private:
         }
     }
 
+    // New method: Check controller connectivity
+    void CheckControllerConnectivity() {
+        Time now = Simulator::Now();
+        double timeSinceLastContact = (now - m_lastControllerContact).GetSeconds();
+        
+        if (timeSinceLastContact > CONTROLLER_TIMEOUT && m_usingSdnRouting) {
+            // Controller is down! Switch to fallback protocol
+            NS_LOG_UNCOND("[" << now.GetSeconds() << "s] Node " << GetNode()->GetId() 
+                          << ": Controller timeout (" << timeSinceLastContact << "s)! Switching to " 
+                          << FALLBACK_PROTOCOL << " fallback");
+            SwitchToFallbackRouting();
+        }
+        
+        // Schedule next check
+        m_heartbeatEvent = Simulator::Schedule(Seconds(HEARTBEAT_CHECK_INTERVAL), 
+                                                &VehicleSdnApp::CheckControllerConnectivity, this);
+    }
+    
+    // UPDATED: Switch to fallback routing (AODV/OLSR)
+    void SwitchToFallbackRouting() {
+        if (!m_usingSdnRouting) return; // Already using fallback
+        
+        Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
+        Ptr<Ipv4ListRouting> listRouting = DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+        if (!listRouting) return;
+        
+        // Find Static Routing protocol
+        for (uint32_t i = 0; i < listRouting->GetNRoutingProtocols(); ++i) {
+            int16_t priority;
+            Ptr<Ipv4RoutingProtocol> proto = listRouting->GetRoutingProtocol(i, priority);
+            
+            if (DynamicCast<Ipv4StaticRouting>(proto)) {
+                Ptr<Ipv4StaticRouting> staticRouting = DynamicCast<Ipv4StaticRouting>(proto);
+                // Clear SDN routes. 
+                PurgeSDNRoutes(staticRouting);
+                break;
+            }
+        }
+        
+        m_cachedRoutes.clear();
+        m_usingSdnRouting = false;
+    }
+    
+    // New method: Switch back to SDN routing
+    void SwitchToSdnRouting() {
+        if (m_usingSdnRouting) return; // Already using SDN
+        m_usingSdnRouting = true;
+    }
+
     Ptr<Socket> m_beaconTx, m_beaconRx, m_ctrlRx;
     Ipv4Address m_controllerIp;
     uint32_t m_dataIfIndex, m_ctrlIfIndex;
     std::set<Ipv4Address> m_neighbors;
     std::map<Ipv4Address, Ipv4Address> m_cachedRoutes; // dst -> nextHop cache
     std::map<Ipv4Address, Ptr<Node>> m_ipToNodeCache; // IP -> Node lookup cache
-    EventId m_beaconEvent, m_reportEvent;
+    EventId m_beaconEvent, m_reportEvent, m_heartbeatEvent;
+    
+    // Failure recovery state
+    bool m_usingSdnRouting;
+    Time m_lastControllerContact;
 };
 
 // --- CONTROLLER APP ---
@@ -317,6 +437,17 @@ private:
 
     void ReceiveReport(Ptr<Socket> socket) {
         Address from; Ptr<Packet> pkt = socket->RecvFrom(from);
+        
+        // === UPDATED: REALISTIC FAILURE SIMULATION ===
+        // If controller is down, it acts dead (drops received reports)
+        if (g_failureStartTime >= 0) {
+            double now = Simulator::Now().GetSeconds();
+            if (now >= g_failureStartTime && now <= (g_failureStartTime + g_failureDuration)) {
+                return; // Drop the report (Controller is offline)
+            }
+        }
+        // =============================================
+
         if (pkt->GetSize() == 0) return;
         std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0); pkt->CopyData(buffer.data(), pkt->GetSize());
         std::stringstream ss((char*)buffer.data());
@@ -331,7 +462,6 @@ private:
         uint32_t srcId = srcNode->GetId();
         m_topology[srcId].clear();
         
-        // --- CRITICAL FIX FROM SUS CODE: DISTANCE CHECK ---
         Ptr<MobilityModel> srcMob = srcNode->GetObject<MobilityModel>();
 
         while (ss >> nbrCtrlIpStr) {
@@ -352,6 +482,26 @@ private:
     }
 
     void RecomputeRoutes() {
+        // === CONTROLLER FAILURE SIMULATION ===
+        if (g_failureStartTime >= 0) {
+            double currentTime = Simulator::Now().GetSeconds();
+            double failureEnd = g_failureStartTime + g_failureDuration;
+            
+            if (currentTime >= g_failureStartTime && currentTime <= failureEnd) {
+                // Controller is in failure mode - don't send routes!
+                NS_LOG_UNCOND("[" << currentTime << "s] CONTROLLER FAILURE MODE - Not sending routes (" 
+                              << (failureEnd - currentTime) << "s remaining)");
+                
+                // Realistic: Clear topology because we are "rebooting" or disconnected
+                m_topology.clear();
+                m_lastTopology.clear();
+
+                m_routeEvent = Simulator::Schedule(Seconds(ROUTE_RECOMPUTE_INTERVAL), &SdnControllerApp::RecomputeRoutes, this);
+                return; 
+            }
+        }
+        // === END FAILURE SIMULATION ===
+        
         if (!g_sdnNodes) return;
         
         // Only recompute if topology *actually* changed (not just order)
@@ -431,9 +581,13 @@ int main (int argc, char *argv[])
   int runId = 1;
   std::string traceFile = ""; 
   std::string outputDir = "."; 
-  double simTime = 60.0;      // Change to 60 for quick res
+  double simTime = 60.0;      
   uint32_t numNodes = 50; 
-  bool enableNetAnim = false; 
+  bool enableNetAnim = false;
+  
+  // Failure simulation parameters
+  double failureStart = -1.0;  // When to start controller failure (-1 = disabled)
+  double failureDuration = 0.0; // How long the failure lasts
 
   CommandLine cmd;
   cmd.AddValue ("protocol", "Protocol (AODV, DSDV, OLSR, SDN)", protocol);
@@ -442,7 +596,13 @@ int main (int argc, char *argv[])
   cmd.AddValue ("traceFile", "Trace file", traceFile);
   cmd.AddValue ("outputDir", "Output Directory", outputDir);
   cmd.AddValue ("netanim", "Enable NetAnim", enableNetAnim);
+  cmd.AddValue ("failureStart", "Controller failure start time in seconds (-1=disabled)", failureStart);
+  cmd.AddValue ("failureDuration", "Controller failure duration in seconds", failureDuration);
   cmd.Parse (argc, argv);
+  
+  // Set global failure parameters for controller to use
+  g_failureStartTime = failureStart;
+  g_failureDuration = failureDuration;
 
   if (traceFile.empty ()) {
       traceFile = "scratch/mobility/mobility_" + std::to_string(speed) + ".tcl";
@@ -521,6 +681,20 @@ int main (int argc, char *argv[])
   else 
   {
       NS_LOG_UNCOND("Running SDN Mode (Hybrid: Reporting + Distance Check)");
+      
+      // Display failure simulation status
+      if (failureStart >= 0) {
+          NS_LOG_UNCOND("⚠️  CONTROLLER FAILURE SIMULATION ENABLED");
+          NS_LOG_UNCOND("   Failure Period: " << failureStart << "s - " << (failureStart + failureDuration) << "s (" << failureDuration << "s duration)");
+          NS_LOG_UNCOND("   Expected Behavior:");
+          NS_LOG_UNCOND("   - Controller stops sending routes at " << failureStart << "s");
+          NS_LOG_UNCOND("   - Vehicles detect timeout ~" << (failureStart + CONTROLLER_TIMEOUT) << "s");
+          NS_LOG_UNCOND("   - Vehicles switch to " << FALLBACK_PROTOCOL << " fallback");
+          NS_LOG_UNCOND("   - Controller recovers at " << (failureStart + failureDuration) << "s");
+          NS_LOG_UNCOND("   - Vehicles switch back to SDN when routes resume");
+      } else {
+          NS_LOG_UNCOND("✓ Normal operation - No failure simulation");
+      }
 
       NodeContainer vehicles; vehicles.Create(numNodes);
       NodeContainer controller; controller.Create(1);
@@ -535,22 +709,22 @@ int main (int argc, char *argv[])
       mobilityCtrl.Install(controller);
       controller.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(500, 500, 0));
 
-    WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211p);
-    // Higher rate for better throughput: 12 Mbps on 10 MHz channel
-    wifiData.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+      WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211p);
+      // Higher rate for better throughput: 12 Mbps on 10 MHz channel
+      wifiData.SetRemoteStationManager("ns3::ConstantRateWifiManager",
                            "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
                            "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
-    Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
-    YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
-    chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-    chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-    chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
-    phyData.SetChannel (chanData.Create ());
-    phyData.Set("TxPowerStart", DoubleValue(20.0));
-    phyData.Set("TxPowerEnd", DoubleValue(20.0));
-    phyData.Set("ChannelWidth", UintegerValue(10));
-    WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
-    NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
+      Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
+      YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
+      chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+      chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+      chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
+      phyData.SetChannel (chanData.Create ());
+      phyData.Set("TxPowerStart", DoubleValue(20.0));
+      phyData.Set("TxPowerEnd", DoubleValue(20.0));
+      phyData.Set("ChannelWidth", UintegerValue(10));
+      WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
+      NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
 
       WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
       YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
@@ -561,10 +735,26 @@ int main (int argc, char *argv[])
       NetDeviceContainer devCtrlVeh = wifiCtrl.Install(phyCtrl, macCtrl, vehicles);
       NetDeviceContainer devCtrlNode = wifiCtrl.Install(phyCtrl, macCtrl, controller);
 
+      // Setup hybrid routing: Static (SDN) + Fallback (AODV/OLSR)
       InternetStackHelper stack;
       Ipv4ListRoutingHelper list;
+      
+      // Add static routing (for SDN) with HIGH priority (active by default)
       Ipv4StaticRoutingHelper staticRouting;
-      list.Add(staticRouting, 100); 
+      list.Add(staticRouting, 100);
+      
+      // Add fallback protocol with LOWER priority (static=100 takes precedence)
+      if (FALLBACK_PROTOCOL == "AODV") {
+          AodvHelper aodv;
+          list.Add(aodv, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
+          NS_LOG_UNCOND("SDN Mode: Using AODV as fallback protocol");
+      }
+      else if (FALLBACK_PROTOCOL == "OLSR") {
+          OlsrHelper olsr;
+          list.Add(olsr, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
+          NS_LOG_UNCOND("SDN Mode: Using OLSR as fallback protocol");
+      }
+      
       stack.SetRoutingHelper(list);
       stack.Install(allNodes);
 
@@ -614,6 +804,16 @@ int main (int argc, char *argv[])
           for(uint32_t i=0; i<vehicles.GetN(); ++i) anim.UpdateNodeColor(vehicles.Get(i), 0, 0, 255);
           anim.UpdateNodeColor(controller.Get(0), 255, 0, 0);
       }
+
+      // === PDR MONITORING CONNECTIONS ===
+      // Connect to the specific UdpEchoClient and Server traces
+      Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoClient/Tx", MakeCallback(&MonitorTxCallback));
+      Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoServer/Rx", MakeCallback(&MonitorRxCallback));
+
+      // Schedule the CSV recording
+      std::string csvFileName = outputDir + "/pdr_graph_" + protocol + "_" + std::to_string(speed) + ".csv";
+      Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, csvFileName);
+      // ==================================
 
       Simulator::Stop (Seconds (simTime)); Simulator::Run ();
       monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
