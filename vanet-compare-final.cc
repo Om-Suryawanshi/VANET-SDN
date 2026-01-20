@@ -114,7 +114,7 @@ const uint32_t CONTROLLER_NODE_ID = 50;       // Fixed ID for SDN controller
 // === FAILURE RECOVERY CONFIGURATION ===
 const double CONTROLLER_TIMEOUT = 2.0;        // Seconds without controller response = failure
 const double HEARTBEAT_CHECK_INTERVAL = 0.5;  // How often to check controller connectivity
-const std::string FALLBACK_PROTOCOL = "AODV"; // Fallback protocol: "AODV" or "OLSR"
+const std::string FALLBACK_PROTOCOL = "OLSR"; // Fallback protocol: "AODV" or "OLSR"
 
 // === IP CONFIGURATION ===
 const char* DATA_NETWORK_PREFIX = "10.1.0.0";
@@ -576,249 +576,250 @@ private:
 
 int main (int argc, char *argv[])
 {
-  std::string protocol = "AODV"; 
-  int speed = 10;
-  int runId = 1;
-  std::string traceFile = ""; 
-  std::string outputDir = "."; 
-  double simTime = 60.0;      
-  uint32_t numNodes = 50; 
-  bool enableNetAnim = false;
-  
-  // Failure simulation parameters
-  double failureStart = -1.0;  // When to start controller failure (-1 = disabled)
-  double failureDuration = 0.0; // How long the failure lasts
+    std::string protocol = "AODV"; 
+    int speed = 10;
+    int runId = 1;
+    std::string traceFile = ""; 
+    std::string outputDir = "."; 
+    double simTime = 200.0;
+    uint32_t numNodes = 50; 
+    bool enableNetAnim = false;
+    
+    // Failure simulation parameters
+    double failureStart = -1.0;  // When to start controller failure (-1 = disabled)
+    double failureDuration = 0.0; // How long the failure lasts
 
-  CommandLine cmd;
-  cmd.AddValue ("protocol", "Protocol (AODV, DSDV, OLSR, SDN)", protocol);
-  cmd.AddValue ("speed", "Speed", speed);
-  cmd.AddValue ("runId", "Run ID", runId);
-  cmd.AddValue ("traceFile", "Trace file", traceFile);
-  cmd.AddValue ("outputDir", "Output Directory", outputDir);
-  cmd.AddValue ("netanim", "Enable NetAnim", enableNetAnim);
-  cmd.AddValue ("failureStart", "Controller failure start time in seconds (-1=disabled)", failureStart);
-  cmd.AddValue ("failureDuration", "Controller failure duration in seconds", failureDuration);
-  cmd.Parse (argc, argv);
-  
-  // Set global failure parameters for controller to use
-  g_failureStartTime = failureStart;
-  g_failureDuration = failureDuration;
+    CommandLine cmd;
+    cmd.AddValue ("protocol", "Protocol (AODV, DSDV, OLSR, SDN)", protocol);
+    cmd.AddValue ("speed", "Speed", speed);
+    cmd.AddValue ("runId", "Run ID", runId);
+    cmd.AddValue ("traceFile", "Trace file", traceFile);
+    cmd.AddValue ("outputDir", "Output Directory", outputDir);
+    cmd.AddValue ("netanim", "Enable NetAnim", enableNetAnim);
+    cmd.AddValue ("failureStart", "Controller failure start time in seconds (-1=disabled)", failureStart);
+    cmd.AddValue ("failureDuration", "Controller failure duration in seconds", failureDuration);
+    cmd.Parse (argc, argv);
+    
+    // Set global failure parameters for controller to use
+    g_failureStartTime = failureStart;
+    g_failureDuration = failureDuration;
 
-  if (traceFile.empty ()) {
-      traceFile = "scratch/mobility/mobility_" + std::to_string(speed) + ".tcl";
-  }
-  
-  std::stringstream ss;
-  ss << outputDir << "/result_" << protocol << "_" << speed << "_" << runId << ".xml";
-  std::string xmlFileName = ss.str();
-  
-  std::stringstream ssAnim;
-  ssAnim << outputDir << "/netanim_" << protocol << "_" << speed << "_" << runId << ".xml";
-  std::string animFileName = ssAnim.str();
+    if (traceFile.empty ()) {
+        traceFile = "scratch/mobility/mobility_" + std::to_string(speed) + ".tcl";
+    }
+    
+    std::stringstream ss;
+    ss << outputDir << "/result_" << protocol << "_" << speed << "_" << runId << ".xml";
+    std::string xmlFileName = ss.str();
+    
+    std::stringstream ssAnim;
+    ssAnim << outputDir << "/netanim_" << protocol << "_" << speed << "_" << runId << ".xml";
+    std::string animFileName = ssAnim.str();
 
-  RngSeedManager::SetSeed (3 + runId); 
-  RngSeedManager::SetRun (runId);
+    RngSeedManager::SetSeed (3 + runId); 
+    RngSeedManager::SetRun (runId);
 
-  // --------------------------------------------------------------------------
-  //                        TRADITIONAL MODE
-  // --------------------------------------------------------------------------
-  if (protocol != "SDN") 
-  {
-      // ... (Same Traditional Mode Logic as before) ...
-      NS_LOG_UNCOND("Running Traditional Mode: " << protocol);
-      
-      // Configure RTS/CTS BEFORE creating WiFi
-      Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
-      
-      NodeContainer nodes; nodes.Create (numNodes);
-      Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
-      ns2.Install (nodes.Begin(), nodes.End());
+    // --------------------------------------------------------------------------
+    //                        TRADITIONAL MODE
+    // --------------------------------------------------------------------------
+    if (protocol != "SDN") 
+    {
+        // ... (Same Traditional Mode Logic as before) ...
+        NS_LOG_UNCOND("Running Traditional Mode: " << protocol);
+        
+        // Configure RTS/CTS BEFORE creating WiFi
+        Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
+        
+        NodeContainer nodes; nodes.Create (numNodes);
+        Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
+        ns2.Install (nodes.Begin(), nodes.End());
 
-      WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211p);
-      wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                             "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
-                             "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
-      YansWifiPhyHelper wifiPhy; YansWifiChannelHelper wifiChannel;
-      wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-      wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-      wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
-      wifiPhy.SetChannel (wifiChannel.Create ());
-      wifiPhy.Set ("TxPowerStart", DoubleValue(20.0));
-      wifiPhy.Set ("TxPowerEnd", DoubleValue(20.0));
-      wifiPhy.Set("ChannelWidth", UintegerValue(10));
-      WifiMacHelper wifiMac; wifiMac.SetType ("ns3::AdhocWifiMac");
-      NetDeviceContainer devices = wifi.Install (wifiPhy, wifiMac, nodes);
+        WifiHelper wifi; wifi.SetStandard (WIFI_STANDARD_80211p);
+        wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
+                                "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
+        YansWifiPhyHelper wifiPhy; YansWifiChannelHelper wifiChannel;
+        wifiChannel.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+        wifiChannel.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+        wifiChannel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
+        wifiPhy.SetChannel (wifiChannel.Create ());
+        wifiPhy.Set ("TxPowerStart", DoubleValue(20.0));
+        wifiPhy.Set ("TxPowerEnd", DoubleValue(20.0));
+        wifiPhy.Set("ChannelWidth", UintegerValue(10));
+        WifiMacHelper wifiMac; wifiMac.SetType ("ns3::AdhocWifiMac");
+        NetDeviceContainer devices = wifi.Install (wifiPhy, wifiMac, nodes);
 
-      Ipv4ListRoutingHelper list; InternetStackHelper stack;
-      if (protocol == "AODV") { AodvHelper aodv; list.Add (aodv, 100); }
-      else if (protocol == "DSDV") { DsdvHelper dsdv; list.Add (dsdv, 100); }
-      else if (protocol == "OLSR") { OlsrHelper olsr; list.Add (olsr, 100); }
-      stack.SetRoutingHelper (list);
-      stack.Install (nodes);
+        Ipv4ListRoutingHelper list; InternetStackHelper stack;
+        if (protocol == "AODV") { AodvHelper aodv; list.Add (aodv, 100); }
+        else if (protocol == "DSDV") { DsdvHelper dsdv; list.Add (dsdv, 100); }
+        else if (protocol == "OLSR") { OlsrHelper olsr; list.Add (olsr, 100); }
+        stack.SetRoutingHelper (list);
+        stack.Install (nodes);
 
-      Ipv4AddressHelper address; address.SetBase ("10.1.1.0", "255.255.255.0");
-      Ipv4InterfaceContainer interfaces = address.Assign (devices);
+        Ipv4AddressHelper address; address.SetBase ("10.1.1.0", "255.255.255.0");
+        Ipv4InterfaceContainer interfaces = address.Assign (devices);
 
-      uint16_t port = DATA_APP_PORT;
-      UdpEchoServerHelper server (port);
-      ApplicationContainer serverApps = server.Install (nodes.Get (0));
-      serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
-      UdpEchoClientHelper client (interfaces.GetAddress (0), port);
-      client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
-      client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
-      client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
-      ApplicationContainer clientApps = client.Install (nodes.Get (numNodes - 1));
-      clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
+        uint16_t port = DATA_APP_PORT;
+        UdpEchoServerHelper server (port);
+        ApplicationContainer serverApps = server.Install (nodes.Get (0));
+        serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
+        UdpEchoClientHelper client (interfaces.GetAddress (0), port);
+        client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
+        client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
+        client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
+        ApplicationContainer clientApps = client.Install (nodes.Get (numNodes - 1));
+        clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
 
-      FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
-      Simulator::Stop (Seconds (simTime)); Simulator::Run ();
-      monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
-      Simulator::Destroy ();
-  }
-  // --------------------------------------------------------------------------
-  //                              SDN MODE (HYBRID)
-  // --------------------------------------------------------------------------
-  else 
-  {
-      NS_LOG_UNCOND("Running SDN Mode (Hybrid: Reporting + Distance Check)");
-      
-      // Display failure simulation status
-      if (failureStart >= 0) {
-          NS_LOG_UNCOND("⚠️  CONTROLLER FAILURE SIMULATION ENABLED");
-          NS_LOG_UNCOND("   Failure Period: " << failureStart << "s - " << (failureStart + failureDuration) << "s (" << failureDuration << "s duration)");
-          NS_LOG_UNCOND("   Expected Behavior:");
-          NS_LOG_UNCOND("   - Controller stops sending routes at " << failureStart << "s");
-          NS_LOG_UNCOND("   - Vehicles detect timeout ~" << (failureStart + CONTROLLER_TIMEOUT) << "s");
-          NS_LOG_UNCOND("   - Vehicles switch to " << FALLBACK_PROTOCOL << " fallback");
-          NS_LOG_UNCOND("   - Controller recovers at " << (failureStart + failureDuration) << "s");
-          NS_LOG_UNCOND("   - Vehicles switch back to SDN when routes resume");
-      } else {
-          NS_LOG_UNCOND("✓ Normal operation - No failure simulation");
-      }
+        FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+        Simulator::Stop (Seconds (simTime)); Simulator::Run ();
+        monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
+        Simulator::Destroy ();
+    }
+    // --------------------------------------------------------------------------
+    //                              SDN MODE (HYBRID)
+    // --------------------------------------------------------------------------
+    else 
+    {
+        NS_LOG_UNCOND("Running SDN Mode (Hybrid: Reporting + Distance Check)");
+        
+        // Display failure simulation status
+        if (failureStart >= 0) {
+            NS_LOG_UNCOND("⚠️  CONTROLLER FAILURE SIMULATION ENABLED");
+            NS_LOG_UNCOND("   Failure Period: " << failureStart << "s - " << (failureStart + failureDuration) << "s (" << failureDuration << "s duration)");
+            NS_LOG_UNCOND("   Expected Behavior:");
+            NS_LOG_UNCOND("   - Controller stops sending routes at " << failureStart << "s");
+            NS_LOG_UNCOND("   - Vehicles detect timeout ~" << (failureStart + CONTROLLER_TIMEOUT) << "s");
+            NS_LOG_UNCOND("   - Vehicles switch to " << FALLBACK_PROTOCOL << " fallback");
+            NS_LOG_UNCOND("   - Controller recovers at " << (failureStart + failureDuration) << "s");
+            NS_LOG_UNCOND("   - Vehicles switch back to SDN when routes resume");
+        } else {
+            NS_LOG_UNCOND("✓ Normal operation - No failure simulation");
+        }
 
-      NodeContainer vehicles; vehicles.Create(numNodes);
-      NodeContainer controller; controller.Create(1);
-      NodeContainer allNodes = NodeContainer(vehicles, controller);
-      g_sdnNodes = &allNodes;
+        NodeContainer vehicles; vehicles.Create(numNodes);
+        NodeContainer controller; controller.Create(1);
+        NodeContainer allNodes = NodeContainer(vehicles, controller);
+        g_sdnNodes = &allNodes;
 
-      Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
-      ns2.Install (vehicles.Begin(), vehicles.End());
+        Ns2MobilityHelper ns2 = Ns2MobilityHelper (traceFile);
+        ns2.Install (vehicles.Begin(), vehicles.End());
 
-      MobilityHelper mobilityCtrl;
-      mobilityCtrl.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-      mobilityCtrl.Install(controller);
-      controller.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(500, 500, 0));
+        MobilityHelper mobilityCtrl;
+        mobilityCtrl.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+        mobilityCtrl.Install(controller);
+        controller.Get(0)->GetObject<MobilityModel>()->SetPosition(Vector(500, 500, 0));
 
-      WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211p);
-      // Higher rate for better throughput: 12 Mbps on 10 MHz channel
-      wifiData.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                           "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
-                           "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
-      Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
-      YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
-      chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-      chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
-      chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
-      phyData.SetChannel (chanData.Create ());
-      phyData.Set("TxPowerStart", DoubleValue(20.0));
-      phyData.Set("TxPowerEnd", DoubleValue(20.0));
-      phyData.Set("ChannelWidth", UintegerValue(10));
-      WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
-      NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
+        WifiHelper wifiData; wifiData.SetStandard (WIFI_STANDARD_80211p);
+        // Higher rate for better throughput: 12 Mbps on 10 MHz channel
+        wifiData.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                            "DataMode", StringValue("OfdmRate12MbpsBW10MHz"),
+                            "ControlMode", StringValue("OfdmRate6MbpsBW10MHz"));
+        Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", UintegerValue(0));
+        YansWifiPhyHelper phyData; YansWifiChannelHelper chanData;
+        chanData.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+        chanData.AddPropagationLoss ("ns3::FriisPropagationLossModel");
+        chanData.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_DATA_MAX_RANGE));
+        phyData.SetChannel (chanData.Create ());
+        phyData.Set("TxPowerStart", DoubleValue(20.0));
+        phyData.Set("TxPowerEnd", DoubleValue(20.0));
+        phyData.Set("ChannelWidth", UintegerValue(10));
+        WifiMacHelper macData; macData.SetType ("ns3::AdhocWifiMac");
+        NetDeviceContainer devicesData = wifiData.Install(phyData, macData, vehicles);
 
-      WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
-      YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
-      chanCtrl.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
-      chanCtrl.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_CTRL_MAX_RANGE));
-      phyCtrl.SetChannel (chanCtrl.Create ());
-      WifiMacHelper macCtrl; macCtrl.SetType ("ns3::AdhocWifiMac");
-      NetDeviceContainer devCtrlVeh = wifiCtrl.Install(phyCtrl, macCtrl, vehicles);
-      NetDeviceContainer devCtrlNode = wifiCtrl.Install(phyCtrl, macCtrl, controller);
+        WifiHelper wifiCtrl; wifiCtrl.SetStandard (WIFI_STANDARD_80211a);
+        YansWifiPhyHelper phyCtrl; YansWifiChannelHelper chanCtrl;
+        chanCtrl.SetPropagationDelay ("ns3::ConstantSpeedPropagationDelayModel");
+        chanCtrl.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(WIFI_CTRL_MAX_RANGE));
+        phyCtrl.SetChannel (chanCtrl.Create ());
+        WifiMacHelper macCtrl; macCtrl.SetType ("ns3::AdhocWifiMac");
+        NetDeviceContainer devCtrlVeh = wifiCtrl.Install(phyCtrl, macCtrl, vehicles);
+        NetDeviceContainer devCtrlNode = wifiCtrl.Install(phyCtrl, macCtrl, controller);
 
-      // Setup hybrid routing: Static (SDN) + Fallback (AODV/OLSR)
-      InternetStackHelper stack;
-      Ipv4ListRoutingHelper list;
-      
-      // Add static routing (for SDN) with HIGH priority (active by default)
-      Ipv4StaticRoutingHelper staticRouting;
-      list.Add(staticRouting, 100);
-      
-      // Add fallback protocol with LOWER priority (static=100 takes precedence)
-      if (FALLBACK_PROTOCOL == "AODV") {
-          AodvHelper aodv;
-          list.Add(aodv, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
-          NS_LOG_UNCOND("SDN Mode: Using AODV as fallback protocol");
-      }
-      else if (FALLBACK_PROTOCOL == "OLSR") {
-          OlsrHelper olsr;
-          list.Add(olsr, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
-          NS_LOG_UNCOND("SDN Mode: Using OLSR as fallback protocol");
-      }
-      
-      stack.SetRoutingHelper(list);
-      stack.Install(allNodes);
+        // Setup hybrid routing: Static (SDN) + Fallback (AODV/OLSR)
+        InternetStackHelper stack;
+        Ipv4ListRoutingHelper list;
+        
+        // Add static routing (for SDN) with HIGH priority (active by default)
+        Ipv4StaticRoutingHelper staticRouting;
+        list.Add(staticRouting, 100);
+        
+        // Add fallback protocol with LOWER priority (static=100 takes precedence)
+        if (FALLBACK_PROTOCOL == "AODV") {
+            AodvHelper aodv;
+            list.Add(aodv, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
+            NS_LOG_UNCOND("SDN Mode: Using AODV as fallback protocol");
+        }
+        else if (FALLBACK_PROTOCOL == "OLSR") {
+            OlsrHelper olsr;
+            list.Add(olsr, 10); // Lower priority than static (100), so SDN takes precedence when routes exist
+            NS_LOG_UNCOND("SDN Mode: Using OLSR as fallback protocol");
+        }
+        
+        stack.SetRoutingHelper(list);
+        stack.Install(allNodes);
 
-      // ENABLE IP FORWARDING
-      for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
-          vehicles.Get(i)->GetObject<Ipv4>()->SetAttribute("IpForward", BooleanValue(true));
-      }
+        // ENABLE IP FORWARDING
+        for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+            vehicles.Get(i)->GetObject<Ipv4>()->SetAttribute("IpForward", BooleanValue(true));
+        }
 
-      Ipv4AddressHelper ipv4Data; ipv4Data.SetBase (DATA_NETWORK_PREFIX, DATA_NETWORK_MASK);
-      Ipv4InterfaceContainer ifData = ipv4Data.Assign(devicesData);
+        Ipv4AddressHelper ipv4Data; ipv4Data.SetBase (DATA_NETWORK_PREFIX, DATA_NETWORK_MASK);
+        Ipv4InterfaceContainer ifData = ipv4Data.Assign(devicesData);
 
-      Ipv4AddressHelper ipv4Ctrl; ipv4Ctrl.SetBase (CTRL_NETWORK_PREFIX, CTRL_NETWORK_MASK);
-      Ipv4InterfaceContainer ifCtrlVeh = ipv4Ctrl.Assign(devCtrlVeh);
-      Ipv4InterfaceContainer ifCtrlNode = ipv4Ctrl.Assign(devCtrlNode);
+        Ipv4AddressHelper ipv4Ctrl; ipv4Ctrl.SetBase (CTRL_NETWORK_PREFIX, CTRL_NETWORK_MASK);
+        Ipv4InterfaceContainer ifCtrlVeh = ipv4Ctrl.Assign(devCtrlVeh);
+        Ipv4InterfaceContainer ifCtrlNode = ipv4Ctrl.Assign(devCtrlNode);
 
-      Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
-      ctrlApp->SetCtrlIfIndex(CTRL_NODE_IF_INDEX); 
-      controller.Get(0)->AddApplication(ctrlApp);
-      ctrlApp->SetStartTime(Seconds(0.1)); ctrlApp->SetStopTime(Seconds(simTime));
-      
-      Ipv4Address controllerIp = ifCtrlNode.GetAddress(0);
-      for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
-          Ptr<VehicleSdnApp> app = CreateObject<VehicleSdnApp>();
-          app->Setup(controllerIp, DATA_IF_INDEX, CTRL_IF_INDEX); 
-          vehicles.Get(i)->AddApplication(app);
-          app->SetStartTime(Seconds(VEHICLE_APP_START_OFFSET + (i*VEHICLE_APP_STAGGER))); app->SetStopTime(Seconds(simTime));
-      }
+        Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
+        ctrlApp->SetCtrlIfIndex(CTRL_NODE_IF_INDEX); 
+        controller.Get(0)->AddApplication(ctrlApp);
+        ctrlApp->SetStartTime(Seconds(0.1)); ctrlApp->SetStopTime(Seconds(simTime));
+        
+        Ipv4Address controllerIp = ifCtrlNode.GetAddress(0);
+        for (uint32_t i = 0; i < vehicles.GetN(); ++i) {
+            Ptr<VehicleSdnApp> app = CreateObject<VehicleSdnApp>();
+            app->Setup(controllerIp, DATA_IF_INDEX, CTRL_IF_INDEX); 
+            vehicles.Get(i)->AddApplication(app);
+            app->SetStartTime(Seconds(VEHICLE_APP_START_OFFSET + (i*VEHICLE_APP_STAGGER))); app->SetStopTime(Seconds(simTime));
+        }
 
-      uint16_t port = DATA_APP_PORT;
-      UdpEchoServerHelper server (port);
-      ApplicationContainer serverApps = server.Install (vehicles.Get (0));
-      serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
+        uint16_t port = DATA_APP_PORT;
+        UdpEchoServerHelper server (port);
+        ApplicationContainer serverApps = server.Install (vehicles.Get (0));
+        serverApps.Start (Seconds (SERVER_START_TIME)); serverApps.Stop (Seconds (simTime));
 
-      UdpEchoClientHelper client (ifData.GetAddress (0), port);
-      client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
-      client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
-      client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
-      ApplicationContainer clientApps = client.Install (vehicles.Get (numNodes - 1));
-      clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
+        UdpEchoClientHelper client (ifData.GetAddress (0), port);
+        client.SetAttribute ("MaxPackets", UintegerValue (MAX_PACKETS));
+        client.SetAttribute ("Interval", TimeValue (Seconds (PACKET_INTERVAL))); 
+        client.SetAttribute ("PacketSize", UintegerValue (PACKET_SIZE));
+        ApplicationContainer clientApps = client.Install (vehicles.Get (numNodes - 1));
+        clientApps.Start (Seconds (CLIENT_START_TIME)); clientApps.Stop (Seconds (simTime));
 
-      FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
-      
-      if (enableNetAnim) {
-          AnimationInterface anim(animFileName);
-          anim.SetMaxPktsPerTraceFile(999999999999); 
-          anim.EnablePacketMetadata(false); 
-          for(uint32_t i=0; i<vehicles.GetN(); ++i) anim.UpdateNodeColor(vehicles.Get(i), 0, 0, 255);
-          anim.UpdateNodeColor(controller.Get(0), 255, 0, 0);
-      }
+        FlowMonitorHelper flowmon; Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+        
+        if (enableNetAnim) {
+            AnimationInterface anim(animFileName);
+            anim.SetMaxPktsPerTraceFile(999999999999); 
+            anim.EnablePacketMetadata(false); 
+            for(uint32_t i=0; i<vehicles.GetN(); ++i) anim.UpdateNodeColor(vehicles.Get(i), 0, 0, 255);
+            anim.UpdateNodeColor(controller.Get(0), 255, 0, 0);
+        }
 
-      // === PDR MONITORING CONNECTIONS ===
-      // Connect to the specific UdpEchoClient and Server traces
-      Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoClient/Tx", MakeCallback(&MonitorTxCallback));
-      Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoServer/Rx", MakeCallback(&MonitorRxCallback));
+        // === PDR MONITORING CONNECTIONS ===
+        // Connect to the specific UdpEchoClient and Server traces
+        Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoClient/Tx", MakeCallback(&MonitorTxCallback));
+        Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::UdpEchoServer/Rx", MakeCallback(&MonitorRxCallback));
 
-      // Schedule the CSV recording
-      std::string csvFileName = outputDir + "/pdr_graph_" + protocol + "_" + std::to_string(speed) + ".csv";
-      Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, csvFileName);
-      // ==================================
+        // Schedule the CSV recording
+        // std::string csvFileName = outputDir + "/pdr_graph_" + protocol + "_" + std::to_string(speed) + ".csv";
+        std::string csvFileName = outputDir + "/pdr_graph_" + protocol + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+        Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, csvFileName);
+        // ==================================
 
-      Simulator::Stop (Seconds (simTime)); Simulator::Run ();
-      monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
-      Simulator::Destroy ();
-  }
+        Simulator::Stop (Seconds (simTime)); Simulator::Run ();
+        monitor->CheckForLostPackets (); monitor->SerializeToXmlFile (xmlFileName, true, true);
+        Simulator::Destroy ();
+    }
 
-  return 0;
+    return 0;
 }
