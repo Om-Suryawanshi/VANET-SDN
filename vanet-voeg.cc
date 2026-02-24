@@ -1030,16 +1030,19 @@ int main(int argc, char* argv[])
     Simulator::Run();
     monitor->CheckForLostPackets();
     monitor->SerializeToXmlFile(xmlFileName, true, true);
-    // After monitor->SerializeToXmlFile(...) add:
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
-    for (auto iter = stats.begin(); iter != stats.end(); ++iter) {
-        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(iter->first);
+    std::ofstream finalPdr(outputDir + "/final_pdr_VOEG_" + std::to_string(speed) + "_" + std::to_string(runId) + ".txt");
+    for (auto& [flowId, flowStats] : stats) {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+        // Only count data flows (port 9)
         if (t.destinationPort == DATA_APP_PORT) {
-            uint64_t tx = iter->second.txPackets;
-            uint64_t rx = iter->second.rxPackets;
-            double pdr = (tx > 0) ? 100.0 * rx / tx : 0.0;
-            std::cout << "Flow " << iter->first << ": PDR=" << pdr << "%" << std::endl;
+            double pdr = (flowStats.txPackets > 0) ? std::min(100.0, 100.0 * flowStats.rxPackets / flowStats.txPackets) : 0.0;
+            finalPdr << "Flow " << flowId << ": "
+                     << t.sourceAddress << " -> " << t.destinationAddress
+                     << " | Tx=" << flowStats.txPackets
+                     << " Rx=" << flowStats.rxPackets
+                     << " PDR=" << pdr << "%" << std::endl;
         }
     }
     finalPdr.close();
