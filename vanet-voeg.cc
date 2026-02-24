@@ -39,29 +39,54 @@ double g_failureDuration = 0.0;
 // ============================================================================
 //                      PDR MONITORING & GRAPHING
 // ============================================================================
-uint32_t g_pdrTxCount = 0;
-uint32_t g_pdrRxCount = 0;
+
+uint64_t g_pdrTxTotal = 0;      // Cumulative total Tx
+uint64_t g_pdrRxTotal = 0;      // Cumulative total Rx
+uint64_t g_pdrTxLast = 0;       // Last recorded Tx (for per-interval calculation)
+uint64_t g_pdrRxLast = 0;       // Last recorded Rx (for per-interval calculation)
 uint32_t g_cacheHits = 0;
 uint32_t g_cacheMisses = 0;
 
-void MonitorTxCallback(Ptr<const Packet> p) { g_pdrTxCount++; }
-void MonitorRxCallback(Ptr<const Packet> p) { g_pdrRxCount++; }
+void MonitorTxCallback(Ptr<const Packet> p) { g_pdrTxTotal++; }
+void MonitorRxCallback(Ptr<const Packet> p) { g_pdrRxTotal++; }
 
 void RecordPdrPerSecond(std::string filename) {
     static std::ofstream file;
     static double currentTime = 0;
     if (!file.is_open()) {
         file.open(filename.c_str(), std::ios::out);
-        file << "Time,PDR,Tx,Rx" << std::endl;
+        file << "Time,PDR,Tx,Rx,CumulativePDR" << std::endl;
     }
-    double pdr = 0.0;
-    if (g_pdrTxCount > 0) pdr = (double)g_pdrRxCount / g_pdrTxCount * 100.0;
-    file << currentTime << "," << pdr << "," << g_pdrTxCount << "," << g_pdrRxCount << std::endl;
-    g_pdrTxCount = 0;
-    g_pdrRxCount = 0;
+    
+    uint64_t intervalTx = g_pdrTxTotal - g_pdrTxLast;
+    uint64_t intervalRx = g_pdrRxTotal - g_pdrRxLast;
+    
+    double intervalPdr = 0.0;
+    if (intervalTx > 0) {
+        intervalPdr = std::min(100.0, (double)intervalRx / intervalTx * 100.0);
+    } else if (intervalRx > 0) {
+        intervalPdr = (g_pdrTxTotal > 0) ? std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0) : 0.0;
+    }
+    
+    double cumulativePdr = 0.0;
+    if (g_pdrTxTotal > 0) {
+        cumulativePdr = std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0);
+    }
+    
+    file << currentTime << "," 
+         << intervalPdr << "," 
+         << intervalTx << "," 
+         << intervalRx << ","
+         << cumulativePdr << std::endl;
+    
+    // Update last recorded values
+    g_pdrTxLast = g_pdrTxTotal;
+    g_pdrRxLast = g_pdrRxTotal;
+    
     currentTime += 1.0;
     Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, filename);
 }
+
 
 void RecordCacheStatus(std::string filename) {
     static std::ofstream file;
@@ -1005,6 +1030,19 @@ int main(int argc, char* argv[])
     Simulator::Run();
     monitor->CheckForLostPackets();
     monitor->SerializeToXmlFile(xmlFileName, true, true);
+    // After monitor->SerializeToXmlFile(...) add:
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
+    FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
+    for (auto iter = stats.begin(); iter != stats.end(); ++iter) {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(iter->first);
+        if (t.destinationPort == DATA_APP_PORT) {
+            uint64_t tx = iter->second.txPackets;
+            uint64_t rx = iter->second.rxPackets;
+            double pdr = (tx > 0) ? 100.0 * rx / tx : 0.0;
+            std::cout << "Flow " << iter->first << ": PDR=" << pdr << "%" << std::endl;
+        }
+    }
+    finalPdr.close();
     Simulator::Destroy();
 
     return 0;
