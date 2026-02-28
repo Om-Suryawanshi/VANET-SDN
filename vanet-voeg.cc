@@ -823,6 +823,7 @@ private:
 int main(int argc, char* argv[])
 {
     std::string protocol              = "VOEG";
+    std::string scenario              = "grid";
     int         speed                 = 10;
     int         runId                 = 1;
     std::string traceFile             = "";
@@ -837,13 +838,14 @@ int main(int argc, char* argv[])
 
     CommandLine cmd;
     cmd.AddValue("protocol",              "Protocol (VOEG)",                           protocol);
+    cmd.AddValue("scenario",              "Simulation scenario (grid/highway/city)",   scenario);
     cmd.AddValue("speed",                 "Vehicle speed for mobility file selection", speed);
     cmd.AddValue("runId",                 "Simulation run ID",                         runId);
     cmd.AddValue("traceFile",             "Path to mobility trace file",               traceFile);
     cmd.AddValue("outputDir",             "Output directory for results",              outputDir);
     cmd.AddValue("netanim",               "Enable NetAnim output",                     enableNetAnim);
     cmd.AddValue("enableFailure",         "Enable controller failure simulation",      enableFailure);
-    cmd.AddValue("enablePredictionCache", "Enable local route caching",               enablePredictionCache);
+    cmd.AddValue("enablePredictionCache", "Enable local route caching",                enablePredictionCache);
     cmd.AddValue("failureStart",          "Controller failure start time (-1=disabled)", failureStart);
     cmd.AddValue("failureDuration",       "Controller failure duration in seconds",    failureDuration);
     cmd.Parse(argc, argv);
@@ -858,13 +860,13 @@ int main(int argc, char* argv[])
     g_failureDuration  = failureDuration;
 
     if (traceFile.empty()) {
-        traceFile = "scratch/mobility/mobility_" + std::to_string(speed) + ".tcl";
+        traceFile = "scratch/mobility/" + scenario + "/mobility_" + std::to_string(speed) + ".tcl";
     }
 
-    std::string xmlFileName  = outputDir + "/result_VOEG_"       + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
-    std::string csvFileName  = outputDir + "/pdr_graph_VOEG_"    + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string cachFileName = outputDir + "/cache_status_VOEG_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string animFileName = outputDir + "/netanim_VOEG_"       + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string xmlFileName  = outputDir + "/result_VOEG_"      + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string csvFileName  = outputDir + "/pdr_graph_VOEG_"   + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string cachFileName = outputDir + "/cache_status_VOEG_"+ scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string animFileName = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
 
     RngSeedManager::SetSeed(3 + runId);
     RngSeedManager::SetRun(runId);
@@ -1030,23 +1032,46 @@ int main(int argc, char* argv[])
     Simulator::Run();
     monitor->CheckForLostPackets();
     monitor->SerializeToXmlFile(xmlFileName, true, true);
+    
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
-    std::ofstream finalPdr(outputDir + "/final_pdr_VOEG_" + std::to_string(speed) + "_" + std::to_string(runId) + ".txt");
-    for (auto& [flowId, flowStats] : stats) {
+    
+    // Updated Output: PDR, Throughput, and Delay
+    std::ofstream finalStats(outputDir + "/final_stats_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".txt");
+    
+    for (auto const& [flowId, flowStats] : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
+        
         // Only count data flows (port 9)
         if (t.destinationPort == DATA_APP_PORT) {
-            double pdr = (flowStats.txPackets > 0) ? std::min(100.0, 100.0 * flowStats.rxPackets / flowStats.txPackets) : 0.0;
-            finalPdr << "Flow " << flowId << ": "
-                     << t.sourceAddress << " -> " << t.destinationAddress
-                     << " | Tx=" << flowStats.txPackets
-                     << " Rx=" << flowStats.rxPackets
-                     << " PDR=" << pdr << "%" << std::endl;
+            
+            // 1. Packet Delivery Ratio (PDR)
+            double pdr = (flowStats.txPackets > 0) ? 
+                         std::min(100.0, 100.0 * flowStats.rxPackets / flowStats.txPackets) : 0.0;
+            
+            // 2. Throughput (in Kbps)
+            double throughput = 0.0;
+            double duration = (flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket).GetSeconds();
+            if (duration > 0 && flowStats.rxPackets > 0) {
+                // rxBytes * 8 bits / (duration in seconds * 1000) = Kbps
+                throughput = (flowStats.rxBytes * 8.0) / (duration * 1000.0);
+            }
+            // 3. Average End-to-End Delay (in ms)
+            double delay = 0.0;
+            if (flowStats.rxPackets > 0) {
+                delay = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000.0;
+            }
+            finalStats << "Flow ID     : " << flowId << "\n"
+                       << "Connection  : " << t.sourceAddress << " -> " << t.destinationAddress << "\n"
+                       << "Tx Packets  : " << flowStats.txPackets << "\n"
+                       << "Rx Packets  : " << flowStats.rxPackets << "\n"
+                       << "PDR         : " << pdr << " %\n"
+                       << "Throughput  : " << throughput << " kbps\n"
+                       << "Avg Delay   : " << delay << " ms\n"
+                       << "------------------------------------------------\n";
         }
     }
-    finalPdr.close();
+    finalStats.close();
     Simulator::Destroy();
-
     return 0;
 }
