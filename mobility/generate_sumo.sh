@@ -13,7 +13,7 @@ if [[ ! "$SCENARIO" =~ ^(grid|highway|city|all)$ ]]; then
 fi
 
 SPEEDS=(5 10 15 20)
-NUM_VEHICLES=50
+NUM_VEHICLES=100
 SIM_TIME=300
 
 # Added "extra_args" to handle the differences between city/grid and highway
@@ -89,7 +89,7 @@ if [ "$SCENARIO" == "highway" ] || [ "$SCENARIO" == "all" ]; then
     cat > highway.nod.xml <<EOF
 <nodes>
     <node id="node1" x="0.0" y="0.0"/>
-    <node id="node2" x="7000.0" y="0.0"/>
+    <node id="node2" x="3000.0" y="0.0"/>
 </nodes>
 EOF
 
@@ -102,7 +102,7 @@ EOF
 
     netconvert --node-files highway.nod.xml --edge-files highway.edg.xml -o highway.net.xml --no-warnings
     # Use --allow-fringe and force a long minimum distance instead of intermediate stops
-    generate_traces highway.net.xml "--allow-fringe --min-distance 5000"
+    generate_traces highway.net.xml "--allow-fringe --min-distance 2000"
     cd ..
 fi
 
@@ -113,7 +113,7 @@ if [ "$SCENARIO" == "city" ] || [ "$SCENARIO" == "all" ]; then
     echo "[*] Generating City Scenario (Bhubaneswar)..."
     mkdir -p city && cd city
     echo "  -> Downloading OSM data..."
-    wget -qO bhubaneswar.osm "https://overpass-api.de/api/map?bbox=85.8150,20.2600,85.8450,20.2900"
+    wget -qO bhubaneswar.osm "https://overpass-api.de/api/map?bbox=85.8200,20.2650,85.8350,20.2800"
     netconvert --osm-files bhubaneswar.osm -o city.net.xml --geometry.remove --ramps.guess --junctions.join --tls.guess-signals --no-warnings
     generate_traces city.net.xml "--intermediate 10"
     cd ..

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<!-- generated on 2026-02-28T22:10:52.692787+05:30 by Eclipse SUMO netconvert 1.25.0
+<!-- generated on 2026-03-01T13:03:45.053500+05:30 by Eclipse SUMO netconvert 1.25.0
 <netconvertConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netconvertConfiguration.xsd">
 
     <input>
@@ -21,30 +21,30 @@
 
 <net version="1.20" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
 
-    <location netOffset="0.00,0.00" convBoundary="0.00,0.00,7000.00,0.00" origBoundary="0.00,0.00,7000.00,0.00" projParameter="!"/>
+    <location netOffset="0.00,0.00" convBoundary="0.00,0.00,3000.00,0.00" origBoundary="0.00,0.00,3000.00,0.00" projParameter="!"/>
 
     <edge id=":node1_0" function="internal">
         <lane id=":node1_0_0" index="0" speed="3.65" length="4.67" shape="0.00,1.60 -1.20,0.80 -1.60,0.00 -1.20,-0.80 0.00,-1.60"/>
     </edge>
     <edge id=":node2_0" function="internal">
-        <lane id=":node2_0_0" index="0" speed="3.65" length="4.67" shape="7000.00,-1.60 7001.20,-0.80 7001.60,0.00 7001.20,0.80 7000.00,1.60"/>
+        <lane id=":node2_0_0" index="0" speed="3.65" length="4.67" shape="3000.00,-1.60 3001.20,-0.80 3001.60,0.00 3001.20,0.80 3000.00,1.60"/>
     </edge>
 
     <edge id="edge1to2" from="node1" to="node2" priority="-1">
-        <lane id="edge1to2_0" index="0" speed="30.00" length="7000.00" shape="0.00,-8.00 7000.00,-8.00"/>
-        <lane id="edge1to2_1" index="1" speed="30.00" length="7000.00" shape="0.00,-4.80 7000.00,-4.80"/>
-        <lane id="edge1to2_2" index="2" speed="30.00" length="7000.00" shape="0.00,-1.60 7000.00,-1.60"/>
+        <lane id="edge1to2_0" index="0" speed="30.00" length="3000.00" shape="0.00,-8.00 3000.00,-8.00"/>
+        <lane id="edge1to2_1" index="1" speed="30.00" length="3000.00" shape="0.00,-4.80 3000.00,-4.80"/>
+        <lane id="edge1to2_2" index="2" speed="30.00" length="3000.00" shape="0.00,-1.60 3000.00,-1.60"/>
     </edge>
     <edge id="edge2to1" from="node2" to="node1" priority="-1">
-        <lane id="edge2to1_0" index="0" speed="30.00" length="7000.00" shape="7000.00,8.00 0.00,8.00"/>
-        <lane id="edge2to1_1" index="1" speed="30.00" length="7000.00" shape="7000.00,4.80 0.00,4.80"/>
-        <lane id="edge2to1_2" index="2" speed="30.00" length="7000.00" shape="7000.00,1.60 0.00,1.60"/>
+        <lane id="edge2to1_0" index="0" speed="30.00" length="3000.00" shape="3000.00,8.00 0.00,8.00"/>
+        <lane id="edge2to1_1" index="1" speed="30.00" length="3000.00" shape="3000.00,4.80 0.00,4.80"/>
+        <lane id="edge2to1_2" index="2" speed="30.00" length="3000.00" shape="3000.00,1.60 0.00,1.60"/>
     </edge>
 
     <junction id="node1" type="priority" x="0.00" y="0.00" incLanes="edge2to1_0 edge2to1_1 edge2to1_2" intLanes=":node1_0_0" shape="0.00,0.00 0.00,9.60 0.00,0.00">
         <request index="0" response="0" foes="0" cont="0"/>
     </junction>
-    <junction id="node2" type="priority" x="7000.00" y="0.00" incLanes="edge1to2_0 edge1to2_1 edge1to2_2" intLanes=":node2_0_0" shape="7000.00,0.00 7000.00,-9.60 7000.00,0.00">
+    <junction id="node2" type="priority" x="3000.00" y="0.00" incLanes="edge1to2_0 edge1to2_1 edge1to2_2" intLanes=":node2_0_0" shape="3000.00,0.00 3000.00,-9.60 3000.00,0.00">
         <request index="0" response="0" foes="0" cont="0"/>
     </junction>
 

@@ -123,7 +123,7 @@ const int    MSG_PREDICTION_SLOTS = 3;         // Future time slots included in 
 
 // === DISTANCE THRESHOLDS (meters) ===
 const double WIFI_DATA_MAX_RANGE = 350.0;
-const double WIFI_CTRL_MAX_RANGE = 2000.0;
+const double WIFI_CTRL_MAX_RANGE = 15000.0;    // Entire map should be able to acess the controller
 
 // === NETWORK INTERFACE INDICES ===
 const uint32_t DATA_IF_INDEX = 1;
@@ -145,7 +145,7 @@ const double VEHICLE_APP_STAGGER = 0.01;
 const double CONTROLLER_SEND_OFFSET = 0.0005;
 
 // === SPECIAL NODE IDs ===
-const uint32_t CONTROLLER_NODE_ID = 50;
+const uint32_t CONTROLLER_NODE_ID = 100;
 
 // === FAILURE RECOVERY ===
 const double CONTROLLER_TIMEOUT = 2.0;
@@ -829,7 +829,7 @@ int main(int argc, char* argv[])
     std::string traceFile             = "";
     std::string outputDir             = ".";
     double      simTime               = 200.0;
-    uint32_t    numNodes              = 50;
+    uint32_t    numNodes              = 100;
     bool        enableNetAnim         = false;
     bool        enableFailure         = false;
     bool        enablePredictionCache = true;

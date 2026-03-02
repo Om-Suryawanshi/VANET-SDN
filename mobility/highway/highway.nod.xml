@@ -1,4 +1,4 @@
 <nodes>
     <node id="node1" x="0.0" y="0.0"/>
-    <node id="node2" x="7000.0" y="0.0"/>
+    <node id="node2" x="3000.0" y="0.0"/>
 </nodes>
