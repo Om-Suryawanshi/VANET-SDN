@@ -767,7 +767,11 @@ private:
             return;
         }
 
-        // Build the VoEG for the prediction horizon
+        // Step 1: Build single-slot graph for immediate (current-topology) SDN routing
+        std::vector<TimeSlotGraph> currentGraph;
+        BuildEvolvingGraph(currentGraph, 1);
+
+        // Step 2: Build full prediction-horizon graph for prediction cache routing
         std::vector<TimeSlotGraph> evolvingGraph;
         BuildEvolvingGraph(evolvingGraph, static_cast<int>(PREDICTION_HORIZON));
 
@@ -781,25 +785,21 @@ private:
             if (srcId == g_controllerId) continue;
             if (m_vehicleStates.find(srcId) == m_vehicleStates.end()) continue;
 
-            // Run EG-Dijkstra once over the full prediction horizon.
+            // Step 3: Run EG-Dijkstra on current-topology graph for S (SDN) routes
+            auto sdnJourneys = RunEGDijkstra(srcId, currentGraph, baseSlot);
+
+            // Run EG-Dijkstra on full prediction graph for P (prediction cache) routes
             auto journeys = RunEGDijkstra(srcId, evolvingGraph, baseSlot);
 
-            // Build S message: immediate next-hop for current slot (no time indexing)
+            // Build S message: immediate next-hop from current-topology only
             std::ostringstream ssSdn;
             ssSdn << "S";
-            // Build P message: time-indexed prediction routes
-            std::ostringstream ssPred;
-            ssPred << "P";
-
-            for (auto& [dstId, slotMap] : journeys) {
+            for (auto& [dstId, slotMap] : sdnJourneys) {
                 if (dstId == g_controllerId) continue;
                 if (dstId >= g_voegNodes->GetN()) continue;
-
                 Ipv4Address dstDataIp =
                     GetNodeIpv4Address(g_voegNodes->Get(dstId), 1);
                 if (dstDataIp == Ipv4Address::GetZero()) continue;
-
-                // S: use the earliest slot entry as the immediate (current-slot) next-hop
                 if (!slotMap.empty()) {
                     uint32_t nhId = slotMap.begin()->second;
                     if (nhId < g_voegNodes->GetN()) {
@@ -810,6 +810,17 @@ private:
                         }
                     }
                 }
+            }
+
+            // Build P message: time-indexed prediction routes from full horizon graph
+            std::ostringstream ssPred;
+            ssPred << "P";
+            for (auto& [dstId, slotMap] : journeys) {
+                if (dstId == g_controllerId) continue;
+                if (dstId >= g_voegNodes->GetN()) continue;
+                Ipv4Address dstDataIp =
+                    GetNodeIpv4Address(g_voegNodes->Get(dstId), 1);
+                if (dstDataIp == Ipv4Address::GetZero()) continue;
 
                 // P: send at most MSG_PREDICTION_SLOTS time-indexed entries
                 int sent = 0;
