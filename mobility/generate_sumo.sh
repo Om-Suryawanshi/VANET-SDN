@@ -13,7 +13,7 @@ if [[ ! "$SCENARIO" =~ ^(grid|highway|city|all)$ ]]; then
 fi
 
 SPEEDS=(5 10 15 20)
-NUM_VEHICLES=100
+NUM_VEHICLES=60
 SIM_TIME=300
 
 # Added "extra_args" to handle the differences between city/grid and highway
@@ -113,7 +113,7 @@ if [ "$SCENARIO" == "city" ] || [ "$SCENARIO" == "all" ]; then
     echo "[*] Generating City Scenario (Bhubaneswar)..."
     mkdir -p city && cd city
     echo "  -> Downloading OSM data..."
-    wget -qO bhubaneswar.osm "https://overpass-api.de/api/map?bbox=85.8200,20.2650,85.8350,20.2800"
+    wget -qO bhubaneswar.osm "https://overpass-api.de/api/map?bbox=85.8225,20.2675,85.8325,20.2775"
     netconvert --osm-files bhubaneswar.osm -o city.net.xml --geometry.remove --ramps.guess --junctions.join --tls.guess-signals --no-warnings
     generate_traces city.net.xml "--intermediate 10"
     cd ..
