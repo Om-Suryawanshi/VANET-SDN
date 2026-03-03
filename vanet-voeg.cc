@@ -787,6 +787,14 @@ private:
 
             // Step 3: Run EG-Dijkstra on current-topology graph for S (SDN) routes
             auto sdnJourneys = RunEGDijkstra(srcId, currentGraph, baseSlot);
+            // Check routs of 59 to 0 debug
+            // if (srcId == 59) {
+            //     std::cout << "Node 59 SDN routes:\n";
+            //     for (auto& [dstId, slotMap] : sdnJourneys) {
+            //         std::cout << "  -> " << dstId << std::endl;
+            //     }
+            //     std::cout << std::endl;
+            // }
 
             // Run EG-Dijkstra on full prediction graph for P (prediction cache) routes
             auto journeys = RunEGDijkstra(srcId, evolvingGraph, baseSlot);
@@ -838,6 +846,12 @@ private:
             std::string sdnMsg  = ssSdn.str();
             std::string predMsg = ssPred.str();
 
+            // std::cout << "Node " << srcId 
+            //     << " SDN destinations: " 
+            //     << sdnJourneys.size() 
+            //     << std::endl;
+
+
             if (sdnMsg != "S") {
                 Simulator::Schedule(
                     Seconds(i * CONTROLLER_SEND_OFFSET),
@@ -887,7 +901,7 @@ int main(int argc, char* argv[])
     uint32_t    numNodes              = 60;
     bool        enableNetAnim         = false;
     bool        enableFailure         = false;
-    bool        enablePredictionCache = true;
+    bool        enablePredictionCache = false;
     double      failureStart          = -1.0;
     double      failureDuration       = 0.0;
 
