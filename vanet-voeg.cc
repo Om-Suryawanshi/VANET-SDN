@@ -107,13 +107,13 @@ void RecordCacheStatus(std::string filename) {
 // ============================================================================
 // === TIMING PARAMETERS (seconds) ===
 const double REPORT_INTERVAL = 0.25;
-const double ROUTE_RECOMPUTE_INTERVAL = 0.25;
+const double ROUTE_RECOMPUTE_INTERVAL = 1.0; // Old 0.25
 const double CONTROLLER_START_TIME = 0.2;
 const double JITTER_MULTIPLIER = 0.002;
 const double ROUTE_UPDATE_INTERVAL = 0.5;      // How often vehicles update routing table from journey
 
 // === VOEG PARAMETERS ===
-const double PREDICTION_HORIZON = 25.0;        // Time slots to predict ahead
+const double PREDICTION_HORIZON = 10.0;        // Time slots to predict ahead old 0.25
 const double TIME_SLOT_DURATION = 1.0;         // Seconds per time slot
 const double TRANSMISSION_RANGE = 250.0;       // Meters
 const double TRANSMISSION_DELAY = 0.01;        // Seconds per hop (unused: placeholder)
@@ -145,7 +145,7 @@ const double VEHICLE_APP_STAGGER = 0.01;
 const double CONTROLLER_SEND_OFFSET = 0.0005;
 
 // === SPECIAL NODE IDs ===
-const uint32_t CONTROLLER_NODE_ID = 100;
+const uint32_t CONTROLLER_NODE_ID = 50;
 
 // === FAILURE RECOVERY ===
 const double CONTROLLER_TIMEOUT = 2.0;
@@ -714,6 +714,29 @@ private:
                     }
                 }
             }
+
+            // Debug
+
+            // if (s == 0) {
+            //     double totalDegree = 0.0;
+            //     uint32_t nodeCount = ids.size();
+            //     uint32_t isolated = 0;
+
+            //     for (auto& id : ids) {
+            //         auto it = g.adjacency.find(id);
+            //         uint32_t deg = (it != g.adjacency.end()) ? it->second.size() : 0;
+
+            //         totalDegree += deg;
+            //         if (deg == 0) isolated++;
+            //     }
+
+            //     double avgDegree = (nodeCount > 0) ? totalDegree / nodeCount : 0.0;
+
+            //     std::cout << "[" << Simulator::Now().GetSeconds()
+            //         << "s] Avg Degree: " << avgDegree
+            //         << " | Isolated Nodes: " << isolated << std::endl;
+            // }
+
         }
     }
 
@@ -828,8 +851,8 @@ int main(int argc, char* argv[])
     int         runId                 = 1;
     std::string traceFile             = "";
     std::string outputDir             = ".";
-    double      simTime               = 200.0;
-    uint32_t    numNodes              = 100;
+    double      simTime               = 150.0;
+    uint32_t    numNodes              = 50;
     bool        enableNetAnim         = false;
     bool        enableFailure         = false;
     bool        enablePredictionCache = true;
