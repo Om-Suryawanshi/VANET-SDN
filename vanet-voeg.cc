@@ -531,10 +531,11 @@ private:
         if (msgType == 'S') {
             // Immediate SDN route update
             if (!m_usingSdnRouting) {
+                Simulator::Cancel(m_routeUpdateEvent);
+                m_usingSdnRouting = true;
                 NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
                               << GetNode()->GetId()
                               << ": Controller reconnected! Switching back to SDN routing");
-                m_usingSdnRouting = true;
             }
             std::string dstStr, nhStr;
             while (ss >> dstStr >> nhStr) {
@@ -1015,7 +1016,7 @@ private:
             }
 
             std::string msg = ss.str();
-            if (msg.empty())
+            if (ss.str().size() <= 2)
                 continue;
 
             Ptr<Node> targetNode = g_voegNodes->Get(srcId);
@@ -1062,10 +1063,10 @@ private:
                     Ipv4Address dstIp =
                         GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
 
-                    // ---- S message = earliest hop ----
-                    auto firstEntry = *slotMap.begin();
-                    int earliestSlot = firstEntry.first;
-                    uint32_t firstHopId = firstEntry.second;
+                    // ---- S message = current-slot (or nearest future) hop ----
+                    auto itS = slotMap.lower_bound(baseSlot);
+                    if (itS == slotMap.end()) itS = slotMap.begin();
+                    uint32_t firstHopId = itS->second;
 
                     Ipv4Address firstHopIp =
                         GetNodeIpv4Address(g_voegNodes->Get(firstHopId), DATA_IF_INDEX);
@@ -1087,7 +1088,7 @@ private:
                 }
                 Ptr<Node> targetNode = g_voegNodes->Get(srcId);
 
-                if (!sMsg.str().empty())
+                if (sMsg.str().size() > 2)
                 {
                     Simulator::Schedule(
                         Seconds(srcId * CONTROLLER_SEND_OFFSET),
@@ -1097,7 +1098,7 @@ private:
                         sMsg.str());
                 }
 
-                if (!pMsg.str().empty())
+                if (pMsg.str().size() > 2)
                 {
                     Simulator::Schedule(
                         Seconds(srcId * CONTROLLER_SEND_OFFSET + PREDICTION_MESSAGE_OFFSET),
