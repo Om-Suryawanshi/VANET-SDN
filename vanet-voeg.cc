@@ -163,6 +163,12 @@ const uint32_t MAX_PACKETS    = 100000;
 const double   PACKET_INTERVAL = 0.02; // Old 0.1
 const uint32_t PACKET_SIZE    = 1024;
 
+
+double g_totalPathLength = 0.0;
+uint32_t g_totalPaths = 0;
+uint32_t g_totalInstalledRoutes = 0;
+uint32_t g_totalRouteSamples = 0;
+double g_firstPredictionActivation = -1.0;
 // ============================================================================
 //                      VOEG DATA STRUCTURES
 // ============================================================================
@@ -240,15 +246,49 @@ Ipv4Address GetNodeIpv4Address(Ptr<Node> node, uint32_t ifIndex) {
     return ipv4->GetAddress(ifIndex, 0).GetLocal();
 }
 
-Ptr<Node> FindNodeByCtrlIp(Ipv4Address ctrlIp) {
+// Old gpt says not working on highway for node 59
+// Ptr<Node> FindNodeByCtrlIp(Ipv4Address ctrlIp) {
+//     if (!g_voegNodes) return nullptr;
+//     for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i) {
+//         Ptr<Ipv4> ipv4 = g_voegNodes->Get(i)->GetObject<Ipv4>();
+//         for (uint32_t j = 0; j < ipv4->GetNInterfaces(); ++j) {
+//             if (ipv4->GetAddress(j,0).GetLocal() == ctrlIp)
+//                 return g_voegNodes->Get(i);
+//         }
+//     }
+//     return nullptr;
+// }
+
+Ptr<Node> FindNodeByCtrlIp(Ipv4Address ctrlIp)
+{
+    // std::cout << "Total nodes in g_voegNodes: "
+    //       << g_voegNodes->GetN() << std::endl;
+
     if (!g_voegNodes) return nullptr;
-    for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i) {
-        Ptr<Ipv4> ipv4 = g_voegNodes->Get(i)->GetObject<Ipv4>();
-        for (uint32_t j = 0; j < ipv4->GetNInterfaces(); ++j) {
-            if (ipv4->GetAddress(j,0).GetLocal() == ctrlIp)
-                return g_voegNodes->Get(i);
+
+    for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i)
+    {
+        Ptr<Node> node = g_voegNodes->Get(i);
+        Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+        if (!ipv4) continue;
+
+        for (uint32_t j = 0; j < ipv4->GetNInterfaces(); ++j)
+        {
+            for (uint32_t k = 0; k < ipv4->GetNAddresses(j); ++k)
+            {
+                Ipv4Address addr = ipv4->GetAddress(j, k).GetLocal();
+
+                // Only match control subnet
+                if (addr.CombineMask("255.255.255.0") ==
+                    ctrlIp.CombineMask("255.255.255.0"))
+                {
+                    if (addr == ctrlIp)
+                        return node;
+                }
+            }
         }
     }
+
     return nullptr;
 }
 
@@ -395,6 +435,8 @@ public:
     }
 
 private:
+    Ptr<Socket> m_reportSocket;
+
     virtual void StartApplication() {
         // Reset last-contact time to now so we don't immediately time out
         m_lastControllerContact = Simulator::Now();
@@ -412,6 +454,21 @@ private:
             Seconds(HEARTBEAT_CHECK_INTERVAL), &VehicleSdnApp::CheckControllerConnectivity, this);
         m_routeUpdateEvent = Simulator::Schedule(
             Seconds(ROUTE_UPDATE_INTERVAL + jitter), &VehicleSdnApp::ApplyPredictionRoutes, this);
+
+        // std::cout << "Node " << GetNode()->GetId()
+        //   << " DATA IP: "
+        //   << GetNodeIpv4Address(GetNode(), 1)
+        //   << " CTRL IP: "
+        //   << GetNodeIpv4Address(GetNode(), 2)
+        //   << std::endl;
+
+        // Temp 
+        m_reportSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+
+        Ipv4Address myCtrlIp = GetNodeIpv4Address(GetNode(), m_ctrlIfIndex);
+
+        m_reportSocket->Bind(InetSocketAddress(myCtrlIp, 0));
+        m_reportSocket->Connect(InetSocketAddress(m_controllerIp, CONTROLLER_REPORT_PORT));
     }
 
     virtual void StopApplication() {
@@ -428,16 +485,27 @@ private:
         Vector vel = mob->GetVelocity();
         Ipv4Address myCtrlIp = GetNodeIpv4Address(GetNode(), m_ctrlIfIndex);
 
+        // if(GetNode()->GetId() == 59 || GetNode()->GetId() == 0)
+        //     std::cout << "Node " << GetNode()->GetId()
+        //         << "Ip :" << myCtrlIp 
+        //         << " pos: " << pos.x << "," << pos.y
+        //         << " vel: " << vel.x << "," << vel.y
+        //         << std::endl;
+
+
         std::ostringstream ss;
         ss << myCtrlIp << " " << pos.x << " " << pos.y << " " << vel.x << " " << vel.y;
         std::string data = ss.str();
 
         Ptr<Packet> pkt = Create<Packet>((uint8_t*)data.c_str(), data.size());
-        Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
-        s->Bind(InetSocketAddress(myCtrlIp, 0));
-        s->Connect(InetSocketAddress(m_controllerIp, CONTROLLER_REPORT_PORT));
-        s->Send(pkt);
-        s->Close();
+        // Ptr<Socket> s = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        // s->Bind(InetSocketAddress(myCtrlIp, 0));
+        // s->Connect(InetSocketAddress(m_controllerIp, CONTROLLER_REPORT_PORT));
+        // s->Send(pkt);
+        // s->Close();
+
+        // Temp
+        m_reportSocket->Send(pkt);
 
         m_reportEvent = Simulator::Schedule(
             Seconds(REPORT_INTERVAL), &VehicleSdnApp::SendReport, this);
@@ -555,13 +623,71 @@ private:
     }
 
     // Purge all SDN host routes and reinstall from m_activeRoutes.
+    // void InstallActiveRoutes() {
+    //     Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
+    //     if (!staticRouting) return;
+    //     PurgeSDNRoutes(staticRouting);
+    //     for (auto& [dst, nh] : m_activeRoutes) {
+    //         staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+    //     }
+    // }
+
     void InstallActiveRoutes() {
         Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
         if (!staticRouting) return;
-        PurgeSDNRoutes(staticRouting);
-        for (auto& [dst, nh] : m_activeRoutes) {
-            staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+
+        // ------------------------------------------------------------------
+        // 1) Remove routes that no longer exist in m_activeRoutes
+        // ------------------------------------------------------------------
+        for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+            Ipv4RoutingTableEntry route = staticRouting->GetRoute(i - 1);
+
+            // Only manage host routes in data network (10.1.0.0/16)
+            if (route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
+                route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) ==
+                    Ipv4Address("10.1.0.0")) {
+
+                Ipv4Address dst = route.GetDest();
+
+                // If destination no longer present in new route set → remove it
+                if (m_activeRoutes.find(dst) == m_activeRoutes.end()) {
+                    staticRouting->RemoveRoute(i - 1);
+                }
+            }
         }
+
+        // ------------------------------------------------------------------
+        // 2) Add or update routes that changed
+        // ------------------------------------------------------------------
+        for (auto& [dst, newNh] : m_activeRoutes) {
+
+            bool routeExists = false;
+            bool needsUpdate = false;
+
+            for (uint32_t i = 0; i < staticRouting->GetNRoutes(); i++) {
+                Ipv4RoutingTableEntry route = staticRouting->GetRoute(i);
+
+                if (route.GetDest() == dst &&
+                    route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255")) {
+
+                    routeExists = true;
+
+                    if (route.GetGateway() != newNh) {
+                        // Next-hop changed → remove old route
+                        staticRouting->RemoveRoute(i);
+                        needsUpdate = true;
+                    }
+                    break;
+                }
+            }
+
+            // Add new route if it didn’t exist or was removed
+            if (!routeExists || needsUpdate) {
+                staticRouting->AddHostRouteTo(dst, newNh, m_dataIfIndex, 0);
+            }
+        }
+        g_totalInstalledRoutes += m_activeRoutes.size();
+        g_totalRouteSamples++;
     }
 
     void CheckControllerConnectivity() {
@@ -572,6 +698,10 @@ private:
                           << ": Controller timeout (" << timeSince
                           << "s)! Switching to prediction routing");
             m_usingSdnRouting = false;
+            if (g_firstPredictionActivation < 0)
+            {
+                g_firstPredictionActivation = Simulator::Now().GetSeconds();
+            }
             Simulator::Cancel(m_routeUpdateEvent);
             if (m_enablePredictionCache && !m_predictionRoutes.empty()) {
                 NS_LOG_UNCOND("  Using VoEG prediction cache for continued routing");
@@ -613,8 +743,13 @@ public:
     }
     SdnControllerApp() : m_ctrlIfIndex(CTRL_NODE_IF_INDEX) {}
     void SetCtrlIfIndex(uint32_t idx) { m_ctrlIfIndex = idx; }
+    void SetPredictionEnabled(bool enabled) {
+        m_enablePrediction = enabled;
+    }
 
 private:
+    bool m_enablePrediction = false;
+    
     virtual void StartApplication() {
         m_recvSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         m_recvSocket->Bind(InetSocketAddress(
@@ -622,7 +757,7 @@ private:
         m_recvSocket->SetRecvCallback(
             MakeCallback(&SdnControllerApp::ReceiveReport, this));
         m_routeEvent = Simulator::Schedule(
-            Seconds(CONTROLLER_START_TIME), &SdnControllerApp::RecomputeRoutes, this);
+            Seconds(2.0), &SdnControllerApp::RecomputeRoutes, this); // Seconds(CONTROLLER_START_TIME)
     }
 
     virtual void StopApplication() {
@@ -657,6 +792,10 @@ private:
         if (!srcNode) return;
 
         uint32_t nodeId = srcNode->GetId();
+
+        // if (nodeId == 59 || nodeId == 0)
+        //     std::cout << "Report from node " << nodeId << std::endl;
+        
         m_vehicleStates[nodeId] = { nodeId, Vector(x, y, 0), Vector(vx, vy, 0) };
     }
 
@@ -672,7 +811,13 @@ private:
         // Collect all node IDs once
         std::vector<uint32_t> ids;
         ids.reserve(m_vehicleStates.size());
-        for (auto& [id, _] : m_vehicleStates) ids.push_back(id);
+        for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i)
+        {
+            if (i == g_controllerId) continue;
+            // Only include nodes that have reported at least once
+            if (m_vehicleStates.find(i) != m_vehicleStates.end())
+                ids.push_back(i);
+        }
 
         for (int s = 0; s < numSlots; ++s) {
             TimeSlotGraph& g = eg[s];
@@ -739,131 +884,230 @@ private:
         }
     }
 
-    void RecomputeRoutes() {
-        // Simulate controller being offline
-        if (g_failureStartTime >= 0) {
-            double now        = Simulator::Now().GetSeconds();
-            double failureEnd = g_failureStartTime + g_failureDuration;
-            if (now >= g_failureStartTime && now <= failureEnd) {
-                NS_LOG_UNCOND("[" << now
-                              << "s] VOEG CONTROLLER FAILURE MODE - Not sending routes ("
-                              << (failureEnd - now) << "s remaining)");
-                // Clear vehicle states intentionally: simulates the controller
-                // "rebooting" and losing all topology knowledge.  Routes will
-                // resume after vehicles resend their next mobility reports
-                // (within REPORT_INTERVAL seconds of controller recovery).
-                m_vehicleStates.clear();
+    void RecomputeRoutes()
+    {
+        if (!g_voegNodes) return;
+
+        if (!m_enablePrediction)
+        {
+        // --------------------------------------------------------------------
+        // 1) Build snapshot graph (current slot only)
+        // --------------------------------------------------------------------
+        std::vector<TimeSlotGraph> currentGraph;
+        BuildEvolvingGraph(currentGraph, 1);   // 1 slot = snapshot
+
+            if (currentGraph.empty())
+            {
                 m_routeEvent = Simulator::Schedule(
                     Seconds(ROUTE_RECOMPUTE_INTERVAL),
                     &SdnControllerApp::RecomputeRoutes, this);
                 return;
             }
-        }
 
-        if (!g_voegNodes || m_vehicleStates.empty()) {
-            m_routeEvent = Simulator::Schedule(
-                Seconds(ROUTE_RECOMPUTE_INTERVAL),
-                &SdnControllerApp::RecomputeRoutes, this);
-            return;
-        }
+            auto& adj = currentGraph[0].adjacency;
+        // Debug Block for highway
+        // uint32_t lastVehicle = g_voegNodes->GetN() - 2;  // controller is last node
 
-        // Step 1: Build single-slot graph for immediate (current-topology) SDN routing
-        std::vector<TimeSlotGraph> currentGraph;
-        BuildEvolvingGraph(currentGraph, 1);
+        // if (adj.find(lastVehicle) != adj.end())
+        // {
+        //     std::cout << "[" << Simulator::Now().GetSeconds()
+        //             << "s] Node " << lastVehicle << " neighbors: ";
 
-        // Step 2: Build full prediction-horizon graph for prediction cache routing
-        std::vector<TimeSlotGraph> evolvingGraph;
-        BuildEvolvingGraph(evolvingGraph, static_cast<int>(PREDICTION_HORIZON));
+        //     for (auto v : adj[lastVehicle])
+        //         std::cout << v << " ";
 
-        double now         = Simulator::Now().GetSeconds();
-        int    baseSlot    = static_cast<int>(now / TIME_SLOT_DURATION);
+        //     std::cout << std::endl;
+        // }
+        // else
+        // {
+        //     std::cout << "[" << Simulator::Now().GetSeconds()
+        //             << "s] Node " << lastVehicle
+        //             << " has NO adjacency entry\n";
+        // }
 
-        // For each source vehicle, run EG-Dijkstra and dispatch route packets
-        for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i) {
-            Ptr<Node> srcNode = g_voegNodes->Get(i);
-            uint32_t  srcId   = srcNode->GetId();
-            if (srcId == g_controllerId) continue;
-            if (m_vehicleStates.find(srcId) == m_vehicleStates.end()) continue;
+        // --------------------------------------------------------------------
+        // 2) For each vehicle compute BFS shortest paths
+        // --------------------------------------------------------------------
+            for (uint32_t srcId = 0; srcId < g_voegNodes->GetN(); ++srcId)
+            {
+                if (srcId == g_controllerId) continue;
 
-            // Step 3: Run EG-Dijkstra on current-topology graph for S (SDN) routes
-            auto sdnJourneys = RunEGDijkstra(srcId, currentGraph, baseSlot);
-            // Check routs of 59 to 0 debug
-            // if (srcId == 59) {
-            //     std::cout << "Node 59 SDN routes:\n";
-            //     for (auto& [dstId, slotMap] : sdnJourneys) {
-            //         std::cout << "  -> " << dstId << std::endl;
-            //     }
-            //     std::cout << std::endl;
-            // }
+                if (adj.find(srcId) == adj.end())
+                    continue;
 
-            // Run EG-Dijkstra on full prediction graph for P (prediction cache) routes
-            auto journeys = RunEGDijkstra(srcId, evolvingGraph, baseSlot);
+                std::map<uint32_t, uint32_t> parent;
+                std::map<uint32_t, uint32_t> nextHop;
+                std::set<uint32_t> visited;
+                std::queue<uint32_t> q;
 
-            // Build S message: immediate next-hop from current-topology only
-            std::ostringstream ssSdn;
-            ssSdn << "S";
-            for (auto& [dstId, slotMap] : sdnJourneys) {
-                if (dstId == g_controllerId) continue;
-                if (dstId >= g_voegNodes->GetN()) continue;
-                Ipv4Address dstDataIp =
-                    GetNodeIpv4Address(g_voegNodes->Get(dstId), 1);
-                if (dstDataIp == Ipv4Address::GetZero()) continue;
-                if (!slotMap.empty()) {
-                    uint32_t nhId = slotMap.begin()->second;
-                    if (nhId < g_voegNodes->GetN()) {
-                        Ipv4Address nhDataIp =
-                            GetNodeIpv4Address(g_voegNodes->Get(nhId), 1);
-                        if (nhDataIp != Ipv4Address::GetZero()) {
-                            ssSdn << " " << dstDataIp << " " << nhDataIp;
+                q.push(srcId);
+                visited.insert(srcId);
+                parent[srcId] = srcId;
+
+                while (!q.empty())
+                {
+                    uint32_t u = q.front();
+                    q.pop();
+
+                    for (uint32_t v : adj[u])
+                    {
+                        if (visited.find(v) == visited.end())
+                        {
+                            visited.insert(v);
+                            parent[v] = u;
+                            q.push(v);
                         }
                     }
                 }
+
+                // ----------------------------------------------------------------
+                // 3) Build next-hop table
+                // ----------------------------------------------------------------
+                for (uint32_t dst : visited)
+                {
+                    if (dst == srcId) continue;
+                    if (dst == g_controllerId) continue;
+
+                    uint32_t hopCount = 0;
+                    uint32_t curr = dst;
+
+                    while (parent[curr] != srcId)
+                    {
+                        curr = parent[curr];
+                        hopCount++;
+                    }
+                    hopCount++;
+                    g_totalPathLength += hopCount;
+                    g_totalPaths++;
+
+                    nextHop[dst] = curr;
+                }
+                if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
+                {
+                    if (nextHop.find(0) == nextHop.end())
+                    {
+                        std::cout << "[" << Simulator::Now().GetSeconds()
+                                << "s] NO PATH from "
+                                << srcId << " to 0\n";
+                    }
+                }
+
+                if (nextHop.empty())
+                    continue;
+
+            
+
+            // ----------------------------------------------------------------
+            // 4) Build route message
+            // ----------------------------------------------------------------
+            std::ostringstream ss;
+            ss << "S ";
+
+            for (auto& [dstId, nhId] : nextHop)
+            {
+                Ipv4Address dstIp =
+                    GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
+
+                Ipv4Address nhIp =
+                    GetNodeIpv4Address(g_voegNodes->Get(nhId), DATA_IF_INDEX);
+
+                ss << dstIp << " " << nhIp << " ";
             }
 
-            // Build P message: time-indexed prediction routes from full horizon graph
-            std::ostringstream ssPred;
-            ssPred << "P";
-            for (auto& [dstId, slotMap] : journeys) {
-                if (dstId == g_controllerId) continue;
-                if (dstId >= g_voegNodes->GetN()) continue;
-                Ipv4Address dstDataIp =
-                    GetNodeIpv4Address(g_voegNodes->Get(dstId), 1);
-                if (dstDataIp == Ipv4Address::GetZero()) continue;
+            std::string msg = ss.str();
+            if (msg.empty())
+                continue;
 
-                // P: send at most MSG_PREDICTION_SLOTS time-indexed entries
-                int sent = 0;
-                for (auto& [slot, nhId] : slotMap) {
-                    if (sent >= MSG_PREDICTION_SLOTS) break;
-                    if (nhId >= g_voegNodes->GetN()) continue;
-                    Ipv4Address nhDataIp =
-                        GetNodeIpv4Address(g_voegNodes->Get(nhId), 1);
-                    if (nhDataIp == Ipv4Address::GetZero()) continue;
-                    ssPred << " " << slot << " " << dstDataIp << " " << nhDataIp;
-                    ++sent;
+            Ptr<Node> targetNode = g_voegNodes->Get(srcId);
+
+            Simulator::Schedule(
+                Seconds(srcId * CONTROLLER_SEND_OFFSET),
+                &SdnControllerApp::SendRoutePacket,
+                this,
+                targetNode,
+                msg);
+        }
+    }
+    else
+    {
+              // ---------------------------------------
+            // FULL VOEG: Multi-slot + EG-Dijkstra
+            // ---------------------------------------
+            int numSlots = static_cast<int>(PREDICTION_HORIZON / TIME_SLOT_DURATION);
+
+            std::vector<TimeSlotGraph> eg;
+            BuildEvolvingGraph(eg, numSlots);
+
+            int baseSlot = static_cast<int>(
+                Simulator::Now().GetSeconds() / TIME_SLOT_DURATION);
+
+            for (uint32_t srcId = 0; srcId < g_voegNodes->GetN(); ++srcId)
+            {
+                if (srcId == g_controllerId) continue;
+
+                auto journeys = RunEGDijkstra(srcId, eg, baseSlot);
+
+                if (journeys.empty()) continue;
+
+                std::ostringstream sMsg;
+                std::ostringstream pMsg;
+
+                sMsg << "S ";
+                pMsg << "P ";
+
+                for (auto& [dstId, slotMap] : journeys)
+                {
+                    if (slotMap.empty()) continue;
+
+                    Ipv4Address dstIp =
+                        GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
+
+                    // ---- S message = earliest hop ----
+                    auto firstEntry = *slotMap.begin();
+                    int earliestSlot = firstEntry.first;
+                    uint32_t firstHopId = firstEntry.second;
+
+                    Ipv4Address firstHopIp =
+                        GetNodeIpv4Address(g_voegNodes->Get(firstHopId), DATA_IF_INDEX);
+
+                    sMsg << dstIp << " " << firstHopIp << " ";
+
+                    // ---- P message = all future hops ----
+                    for (auto& [slot, nextHopId] : slotMap)
+                    {
+                        Ipv4Address nhIp =
+                            GetNodeIpv4Address(g_voegNodes->Get(nextHopId), DATA_IF_INDEX);
+
+                        pMsg << slot << " "
+                            << dstIp << " "
+                            << nhIp << " ";
+                    }
+                    g_totalPathLength += slotMap.size();
+                    g_totalPaths++;
+                }
+                Ptr<Node> targetNode = g_voegNodes->Get(srcId);
+
+                if (!sMsg.str().empty())
+                {
+                    Simulator::Schedule(
+                        Seconds(srcId * CONTROLLER_SEND_OFFSET),
+                        &SdnControllerApp::SendRoutePacket,
+                        this,
+                        targetNode,
+                        sMsg.str());
+                }
+
+                if (!pMsg.str().empty())
+                {
+                    Simulator::Schedule(
+                        Seconds(srcId * CONTROLLER_SEND_OFFSET + PREDICTION_MESSAGE_OFFSET),
+                        &SdnControllerApp::SendRoutePacket,
+                        this,
+                        targetNode,
+                        pMsg.str());
                 }
             }
-
-            std::string sdnMsg  = ssSdn.str();
-            std::string predMsg = ssPred.str();
-
-            // std::cout << "Node " << srcId 
-            //     << " SDN destinations: " 
-            //     << sdnJourneys.size() 
-            //     << std::endl;
-
-
-            if (sdnMsg != "S") {
-                Simulator::Schedule(
-                    Seconds(i * CONTROLLER_SEND_OFFSET),
-                    &SdnControllerApp::SendRoutePacket, this, srcNode, sdnMsg);
-            }
-            if (predMsg != "P") {
-                Simulator::Schedule(
-                    Seconds(i * CONTROLLER_SEND_OFFSET + PREDICTION_MESSAGE_OFFSET),
-                    &SdnControllerApp::SendRoutePacket, this, srcNode, predMsg);
-            }
         }
-
         m_routeEvent = Simulator::Schedule(
             Seconds(ROUTE_RECOMPUTE_INTERVAL),
             &SdnControllerApp::RecomputeRoutes, this);
@@ -961,6 +1205,7 @@ int main(int argc, char* argv[])
     g_controllerId = controller.Get(0)->GetId();
     NS_LOG_UNCOND("Controller ID: " << g_controllerId);
 
+
     // Vehicle mobility from trace file
     Ns2MobilityHelper ns2(traceFile);
     ns2.Install(vehicles.Begin(), vehicles.End());
@@ -1036,9 +1281,11 @@ int main(int argc, char* argv[])
     // Controller app
     Ptr<SdnControllerApp> ctrlApp = CreateObject<SdnControllerApp>();
     ctrlApp->SetCtrlIfIndex(CTRL_NODE_IF_INDEX);
+    ctrlApp->SetPredictionEnabled(enablePredictionCache);
     controller.Get(0)->AddApplication(ctrlApp);
     ctrlApp->SetStartTime(Seconds(0.1));
     ctrlApp->SetStopTime(Seconds(simTime));
+
 
     // Vehicle apps
     Ipv4Address controllerIp = ifCtrlNode.GetAddress(0);
@@ -1139,6 +1386,35 @@ int main(int argc, char* argv[])
                        << "Throughput  : " << throughput << " kbps\n"
                        << "Avg Delay   : " << delay << " ms\n"
                        << "------------------------------------------------\n";
+            finalStats << "\n===== VOEG ADDITIONAL METRICS =====\n";
+
+            // ---- Average Path Length ----
+            double avgPathLen = (g_totalPaths > 0) ?
+                g_totalPathLength / g_totalPaths : 0.0;
+
+            finalStats << "Average Path Length (hops): "
+                    << avgPathLen << "\n";
+
+            // ---- Avg SDN Routes Per Node ----
+            double avgRoutes = (g_totalRouteSamples > 0) ?
+                (double)g_totalInstalledRoutes / g_totalRouteSamples : 0.0;
+
+            finalStats << "Average SDN Routes Installed per Node: "
+                    << avgRoutes << "\n";
+
+            // ---- Failure → Prediction Delay ----
+            if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
+            {
+                double activationDelay =
+                    g_firstPredictionActivation - g_failureStartTime;
+
+                finalStats << "Failure to Prediction Activation Delay: "
+                        << activationDelay << " s\n";
+            }
+            else
+            {
+                finalStats << "Failure to Prediction Activation Delay: N/A\n";
+            }
         }
     }
     finalStats.close();
