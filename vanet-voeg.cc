@@ -141,7 +141,8 @@ const double VEHICLE_APP_START_OFFSET = 0.5;
 const double VEHICLE_APP_STAGGER = 0.01;
 
 // === SCHEDULING OFFSETS ===
-const double CONTROLLER_SEND_OFFSET = 0.0005;
+const double CONTROLLER_SEND_OFFSET      = 0.0005;
+const double PREDICTION_MESSAGE_OFFSET   = 0.0001; // Ensures P msg is sent after S msg per vehicle
 
 // === SPECIAL NODE IDs ===
 // const uint32_t CONTROLLER_NODE_ID = 50;
@@ -410,7 +411,7 @@ private:
         m_heartbeatEvent = Simulator::Schedule(
             Seconds(HEARTBEAT_CHECK_INTERVAL), &VehicleSdnApp::CheckControllerConnectivity, this);
         m_routeUpdateEvent = Simulator::Schedule(
-            Seconds(ROUTE_UPDATE_INTERVAL + jitter), &VehicleSdnApp::UpdateRoutingFromJourney, this);
+            Seconds(ROUTE_UPDATE_INTERVAL + jitter), &VehicleSdnApp::ApplyPredictionRoutes, this);
     }
 
     virtual void StopApplication() {
@@ -442,8 +443,9 @@ private:
             Seconds(REPORT_INTERVAL), &VehicleSdnApp::SendReport, this);
     }
 
-    // Receive time-indexed route update from controller.
-    // Message format: "TimeSlot DstDataIP NextHopDataIP ..."  (triples)
+    // Receive route update from controller.
+    // 'S' messages: "S DstDataIP NextHopDataIP ..."  (pairs, immediate SDN routes)
+    // 'P' messages: "P TimeSlot DstDataIP NextHopDataIP ..."  (triples, prediction cache)
     void ReceiveRoute(Ptr<Socket> socket) {
         Address from;
         Ptr<Packet> pkt = socket->RecvFrom(from);
@@ -451,93 +453,82 @@ private:
 
         m_lastControllerContact = Simulator::Now();
 
-        if (!m_usingSdnRouting) {
-            NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
-                          << GetNode()->GetId()
-                          << ": Controller reconnected! Switching back to VOEG routing");
-            m_usingSdnRouting = true;
-        }
-
         std::vector<uint8_t> buffer(pkt->GetSize() + 1, 0);
         pkt->CopyData(buffer.data(), pkt->GetSize());
         std::stringstream ss((char*)buffer.data());
 
-        int        timeSlot;
-        std::string dstStr, nhStr;
-        while (ss >> timeSlot >> dstStr >> nhStr) {
-            if (dstStr.find('.') == std::string::npos) continue;
-            Ipv4Address dst(dstStr.c_str());
-            Ipv4Address nh(nhStr.c_str());
-            m_journey[dst][timeSlot] = nh;
-        }
+        char msgType;
+        if (!(ss >> msgType)) return;
 
-        // Apply current-slot routes immediately
-        if (m_usingSdnRouting) UpdateRoutingFromJourney();
+        if (msgType == 'S') {
+            // Immediate SDN route update
+            if (!m_usingSdnRouting) {
+                NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
+                              << GetNode()->GetId()
+                              << ": Controller reconnected! Switching back to SDN routing");
+                m_usingSdnRouting = true;
+            }
+            std::string dstStr, nhStr;
+            while (ss >> dstStr >> nhStr) {
+                if (dstStr.find('.') == std::string::npos) continue;
+                m_activeRoutes[Ipv4Address(dstStr.c_str())] = Ipv4Address(nhStr.c_str());
+            }
+            InstallActiveRoutes();
+        } else if (msgType == 'P') {
+            // Prediction cache update — store but do NOT install while controller is alive
+            int timeSlot;
+            std::string dstStr, nhStr;
+            while (ss >> timeSlot >> dstStr >> nhStr) {
+                if (dstStr.find('.') == std::string::npos) continue;
+                m_predictionRoutes[Ipv4Address(dstStr.c_str())][timeSlot] =
+                    Ipv4Address(nhStr.c_str());
+            }
+        }
     }
 
-    // Apply the journey entry for the current time slot to the static routing table.
-    void UpdateRoutingFromJourney() {
-        if (!m_usingSdnRouting) {
+    // Apply prediction routes to the routing table.
+    // Only operates on m_predictionRoutes; only active when controller is down.
+    void ApplyPredictionRoutes() {
+        if (m_usingSdnRouting || !m_enablePredictionCache) {
             m_routeUpdateEvent = Simulator::Schedule(
-                Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::UpdateRoutingFromJourney, this);
+                Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::ApplyPredictionRoutes, this);
             return;
         }
 
         double now         = Simulator::Now().GetSeconds();
         int    currentSlot = static_cast<int>(now / TIME_SLOT_DURATION);
 
-        Ptr<Ipv4StaticRouting> staticRouting;
-        Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
-        Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
-        if (lr) {
-            int16_t priority;
-            for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++) {
-                Ptr<Ipv4RoutingProtocol> temp = lr->GetRoutingProtocol(i, priority);
-                if (DynamicCast<Ipv4StaticRouting>(temp)) {
-                    staticRouting = DynamicCast<Ipv4StaticRouting>(temp);
-                    break;
-                }
-            }
-        }
+        Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
         if (!staticRouting) {
             m_routeUpdateEvent = Simulator::Schedule(
-                Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::UpdateRoutingFromJourney, this);
+                Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::ApplyPredictionRoutes, this);
             return;
         }
 
-        for (auto& [dst, slotMap] : m_journey) {
+        for (auto& [dst, slotMap] : m_predictionRoutes) {
             // Find the closest slot entry at or before currentSlot.
-            // upper_bound returns iterator to first entry with key > currentSlot.
             auto it = slotMap.upper_bound(currentSlot);
-            // If all stored slots are strictly in the future, nothing to apply yet.
             if (it == slotMap.begin()) continue;
             --it; // it->first <= currentSlot
 
             Ipv4Address nh = it->second;
 
-            // Track cache usage: entry from a previous slot = cache hit
-            if (it->first < currentSlot) {
-                g_cacheHits++;
-            } else {
-                g_cacheMisses++;
-            }
+            if (it->first < currentSlot) g_cacheHits++;
+            else                         g_cacheMisses++;
 
-            // Remove old route to this destination and install updated one
             for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
                 Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
                 if (route.GetDest() == dst &&
                     route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
                     route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
                     staticRouting->RemoveRoute(i-1);
-                    // break;
                 }
             }
             staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
-            m_cachedRoutes[dst] = nh;
         }
 
         m_routeUpdateEvent = Simulator::Schedule(
-            Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::UpdateRoutingFromJourney, this);
+            Seconds(ROUTE_UPDATE_INTERVAL), &VehicleSdnApp::ApplyPredictionRoutes, this);
     }
 
     void PurgeSDNRoutes(Ptr<Ipv4StaticRouting> staticRouting) {
@@ -550,41 +541,48 @@ private:
         }
     }
 
+    Ptr<Ipv4StaticRouting> GetStaticRouting() {
+        Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
+        Ptr<Ipv4ListRouting> lr = DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+        if (!lr) return nullptr;
+        int16_t priority;
+        for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++) {
+            Ptr<Ipv4RoutingProtocol> temp = lr->GetRoutingProtocol(i, priority);
+            if (DynamicCast<Ipv4StaticRouting>(temp))
+                return DynamicCast<Ipv4StaticRouting>(temp);
+        }
+        return nullptr;
+    }
+
+    // Purge all SDN host routes and reinstall from m_activeRoutes.
+    void InstallActiveRoutes() {
+        Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
+        if (!staticRouting) return;
+        PurgeSDNRoutes(staticRouting);
+        for (auto& [dst, nh] : m_activeRoutes) {
+            staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+        }
+    }
+
     void CheckControllerConnectivity() {
         double timeSince = (Simulator::Now() - m_lastControllerContact).GetSeconds();
         if (timeSince > CONTROLLER_TIMEOUT && m_usingSdnRouting) {
             NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
                           << GetNode()->GetId()
                           << ": Controller timeout (" << timeSince
-                          << "s)! ");
-            if (m_enablePredictionCache && !m_journey.empty()) {
-                // Use pre-computed VoEG predictions; keep routes in place
+                          << "s)! Switching to prediction routing");
+            m_usingSdnRouting = false;
+            Simulator::Cancel(m_routeUpdateEvent);
+            if (m_enablePredictionCache && !m_predictionRoutes.empty()) {
                 NS_LOG_UNCOND("  Using VoEG prediction cache for continued routing");
             } else {
-                // SwitchToFallbackRouting(); // No need of fallback rn
-                NS_LOG_UNCOND("Controller down — no fallback allowed");
+                NS_LOG_UNCOND("  Controller down — no prediction routes available");
             }
+            ApplyPredictionRoutes();
         }
         m_heartbeatEvent = Simulator::Schedule(
             Seconds(HEARTBEAT_CHECK_INTERVAL),
             &VehicleSdnApp::CheckControllerConnectivity, this);
-    }
-
-    void SwitchToFallbackRouting() {
-        if (!m_usingSdnRouting) return;
-        Ptr<Ipv4> ipv4 = GetNode()->GetObject<Ipv4>();
-        Ptr<Ipv4ListRouting> listRouting = DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
-        if (!listRouting) return;
-        for (uint32_t i = 0; i < listRouting->GetNRoutingProtocols(); ++i) {
-            int16_t priority;
-            Ptr<Ipv4RoutingProtocol> proto = listRouting->GetRoutingProtocol(i, priority);
-            if (DynamicCast<Ipv4StaticRouting>(proto)) {
-                PurgeSDNRoutes(DynamicCast<Ipv4StaticRouting>(proto));
-                break;
-            }
-        }
-        m_cachedRoutes.clear();
-        // m_usingSdnRouting = false;
     }
 
     Ptr<Socket> m_ctrlRx;
@@ -595,10 +593,10 @@ private:
     bool        m_enablePredictionCache;
     Time        m_lastControllerContact;
 
-    // Journey table: dst -> (time_slot -> next_hop)
-    std::map<Ipv4Address, std::map<int,Ipv4Address>> m_journey;
-    // Last-applied routes (cache)
-    std::map<Ipv4Address, Ipv4Address> m_cachedRoutes;
+    // Active SDN routes (installed while controller is reachable): dst -> next-hop
+    std::map<Ipv4Address, Ipv4Address> m_activeRoutes;
+    // Prediction cache (time-indexed, only installed when controller is down): dst -> (slot -> next-hop)
+    std::map<Ipv4Address, std::map<int,Ipv4Address>> m_predictionRoutes;
 };
 
 // ============================================================================
@@ -783,12 +781,15 @@ private:
             if (srcId == g_controllerId) continue;
             if (m_vehicleStates.find(srcId) == m_vehicleStates.end()) continue;
 
-            // Run EG-Dijkstra once from baseSlot.  The algorithm already explores
-            // all future time slots, so a single call naturally produces journey
-            // entries at multiple time slots (covering the prediction window).
-            std::ostringstream ss;
-
+            // Run EG-Dijkstra once over the full prediction horizon.
             auto journeys = RunEGDijkstra(srcId, evolvingGraph, baseSlot);
+
+            // Build S message: immediate next-hop for current slot (no time indexing)
+            std::ostringstream ssSdn;
+            ssSdn << "S";
+            // Build P message: time-indexed prediction routes
+            std::ostringstream ssPred;
+            ssPred << "P";
 
             for (auto& [dstId, slotMap] : journeys) {
                 if (dstId == g_controllerId) continue;
@@ -798,7 +799,19 @@ private:
                     GetNodeIpv4Address(g_voegNodes->Get(dstId), 1);
                 if (dstDataIp == Ipv4Address::GetZero()) continue;
 
-                // Send at most MSG_PREDICTION_SLOTS entries per destination
+                // S: use the earliest slot entry as the immediate (current-slot) next-hop
+                if (!slotMap.empty()) {
+                    uint32_t nhId = slotMap.begin()->second;
+                    if (nhId < g_voegNodes->GetN()) {
+                        Ipv4Address nhDataIp =
+                            GetNodeIpv4Address(g_voegNodes->Get(nhId), 1);
+                        if (nhDataIp != Ipv4Address::GetZero()) {
+                            ssSdn << " " << dstDataIp << " " << nhDataIp;
+                        }
+                    }
+                }
+
+                // P: send at most MSG_PREDICTION_SLOTS time-indexed entries
                 int sent = 0;
                 for (auto& [slot, nhId] : slotMap) {
                     if (sent >= MSG_PREDICTION_SLOTS) break;
@@ -806,17 +819,24 @@ private:
                     Ipv4Address nhDataIp =
                         GetNodeIpv4Address(g_voegNodes->Get(nhId), 1);
                     if (nhDataIp == Ipv4Address::GetZero()) continue;
-                    ss << slot << " " << dstDataIp << " " << nhDataIp << " ";
+                    ssPred << " " << slot << " " << dstDataIp << " " << nhDataIp;
                     ++sent;
                 }
             }
 
-            std::string msg = ss.str();
-            if (msg.empty()) continue;
+            std::string sdnMsg  = ssSdn.str();
+            std::string predMsg = ssPred.str();
 
-            Simulator::Schedule(
-                Seconds(i * CONTROLLER_SEND_OFFSET),
-                &SdnControllerApp::SendRoutePacket, this, srcNode, msg);
+            if (sdnMsg != "S") {
+                Simulator::Schedule(
+                    Seconds(i * CONTROLLER_SEND_OFFSET),
+                    &SdnControllerApp::SendRoutePacket, this, srcNode, sdnMsg);
+            }
+            if (predMsg != "P") {
+                Simulator::Schedule(
+                    Seconds(i * CONTROLLER_SEND_OFFSET + PREDICTION_MESSAGE_OFFSET),
+                    &SdnControllerApp::SendRoutePacket, this, srcNode, predMsg);
+            }
         }
 
         m_routeEvent = Simulator::Schedule(
