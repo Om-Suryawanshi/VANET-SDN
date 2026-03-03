@@ -886,228 +886,158 @@ private:
 
     void RecomputeRoutes()
     {
-        if (!g_voegNodes) return;
-
-        if (!m_enablePrediction)
-        {
-        // --------------------------------------------------------------------
-        // 1) Build snapshot graph (current slot only)
-        // --------------------------------------------------------------------
-        std::vector<TimeSlotGraph> currentGraph;
-        BuildEvolvingGraph(currentGraph, 1);   // 1 slot = snapshot
-
-            if (currentGraph.empty())
-            {
+        // Simulate controller being offline
+        if (g_failureStartTime >= 0) {
+            double now        = Simulator::Now().GetSeconds();
+            double failureEnd = g_failureStartTime + g_failureDuration;
+            if (now >= g_failureStartTime && now <= failureEnd) {
+                NS_LOG_UNCOND("[" << now
+                              << "s] VOEG CONTROLLER FAILURE MODE - Not sending routes ("
+                              << (failureEnd - now) << "s remaining)");
+                m_vehicleStates.clear();
                 m_routeEvent = Simulator::Schedule(
                     Seconds(ROUTE_RECOMPUTE_INTERVAL),
                     &SdnControllerApp::RecomputeRoutes, this);
                 return;
             }
+        }
 
-            auto& adj = currentGraph[0].adjacency;
-        // Debug Block for highway
-        // uint32_t lastVehicle = g_voegNodes->GetN() - 2;  // controller is last node
-
-        // if (adj.find(lastVehicle) != adj.end())
-        // {
-        //     std::cout << "[" << Simulator::Now().GetSeconds()
-        //             << "s] Node " << lastVehicle << " neighbors: ";
-
-        //     for (auto v : adj[lastVehicle])
-        //         std::cout << v << " ";
-
-        //     std::cout << std::endl;
-        // }
-        // else
-        // {
-        //     std::cout << "[" << Simulator::Now().GetSeconds()
-        //             << "s] Node " << lastVehicle
-        //             << " has NO adjacency entry\n";
-        // }
+        // Skip if no vehicles have reported yet (normal at startup)
+        if (!g_voegNodes || m_vehicleStates.empty()) {
+            m_routeEvent = Simulator::Schedule(
+                Seconds(ROUTE_RECOMPUTE_INTERVAL),
+                &SdnControllerApp::RecomputeRoutes, this);
+            return;
+        }
 
         // --------------------------------------------------------------------
-        // 2) For each vehicle compute BFS shortest paths
+        // Step 1: Build single-slot current-topology graph for S (SDN) routes
         // --------------------------------------------------------------------
-            for (uint32_t srcId = 0; srcId < g_voegNodes->GetN(); ++srcId)
+        std::vector<TimeSlotGraph> currentGraph;
+        BuildEvolvingGraph(currentGraph, 1);
+
+        double now      = Simulator::Now().GetSeconds();
+        int    baseSlot = static_cast<int>(now / TIME_SLOT_DURATION);
+
+        auto& adj = currentGraph[0].adjacency;
+
+        // --------------------------------------------------------------------
+        // Step 2: BFS on current topology — compute and send S messages
+        // --------------------------------------------------------------------
+        for (uint32_t srcId = 0; srcId < g_voegNodes->GetN(); ++srcId)
+        {
+            if (srcId == g_controllerId) continue;
+            if (adj.find(srcId) == adj.end()) continue;
+
+            std::map<uint32_t, uint32_t> parent;
+            std::map<uint32_t, uint32_t> nextHop;
+            std::set<uint32_t> visited;
+            std::queue<uint32_t> q;
+
+            q.push(srcId);
+            visited.insert(srcId);
+            parent[srcId] = srcId;
+
+            while (!q.empty())
             {
-                if (srcId == g_controllerId) continue;
-
-                if (adj.find(srcId) == adj.end())
-                    continue;
-
-                std::map<uint32_t, uint32_t> parent;
-                std::map<uint32_t, uint32_t> nextHop;
-                std::set<uint32_t> visited;
-                std::queue<uint32_t> q;
-
-                q.push(srcId);
-                visited.insert(srcId);
-                parent[srcId] = srcId;
-
-                while (!q.empty())
+                uint32_t u = q.front(); q.pop();
+                for (uint32_t v : adj[u])
                 {
-                    uint32_t u = q.front();
-                    q.pop();
-
-                    for (uint32_t v : adj[u])
+                    if (visited.find(v) == visited.end())
                     {
-                        if (visited.find(v) == visited.end())
-                        {
-                            visited.insert(v);
-                            parent[v] = u;
-                            q.push(v);
-                        }
+                        visited.insert(v);
+                        parent[v] = u;
+                        q.push(v);
                     }
                 }
-
-                // ----------------------------------------------------------------
-                // 3) Build next-hop table
-                // ----------------------------------------------------------------
-                for (uint32_t dst : visited)
-                {
-                    if (dst == srcId) continue;
-                    if (dst == g_controllerId) continue;
-
-                    uint32_t hopCount = 0;
-                    uint32_t curr = dst;
-
-                    while (parent[curr] != srcId)
-                    {
-                        curr = parent[curr];
-                        hopCount++;
-                    }
-                    hopCount++;
-                    g_totalPathLength += hopCount;
-                    g_totalPaths++;
-
-                    nextHop[dst] = curr;
-                }
-                if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
-                {
-                    if (nextHop.find(0) == nextHop.end())
-                    {
-                        std::cout << "[" << Simulator::Now().GetSeconds()
-                                << "s] NO PATH from "
-                                << srcId << " to 0\n";
-                    }
-                }
-
-                if (nextHop.empty())
-                    continue;
-
-            
-
-            // ----------------------------------------------------------------
-            // 4) Build route message
-            // ----------------------------------------------------------------
-            std::ostringstream ss;
-            ss << "S ";
-
-            for (auto& [dstId, nhId] : nextHop)
-            {
-                Ipv4Address dstIp =
-                    GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
-
-                Ipv4Address nhIp =
-                    GetNodeIpv4Address(g_voegNodes->Get(nhId), DATA_IF_INDEX);
-
-                ss << dstIp << " " << nhIp << " ";
             }
 
-            std::string msg = ss.str();
-            if (msg.empty())
-                continue;
+            for (uint32_t dst : visited)
+            {
+                if (dst == srcId) continue;
+                if (dst == g_controllerId) continue;
+
+                uint32_t hopCount = 0;
+                uint32_t curr = dst;
+                while (parent[curr] != srcId)
+                {
+                    curr = parent[curr];
+                    hopCount++;
+                }
+                hopCount++;
+                g_totalPathLength += hopCount;
+                g_totalPaths++;
+                nextHop[dst] = curr;
+            }
+
+            if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (controller is last node)
+            {
+                if (nextHop.find(0) == nextHop.end())
+                {
+                    std::cout << "[" << now << "s] NO PATH from "
+                              << srcId << " to 0\n";
+                }
+            }
+
+            if (nextHop.empty()) continue;
+
+            std::ostringstream sMsg;
+            sMsg << "S ";
+            for (auto& [dstId, nhId] : nextHop)
+            {
+                Ipv4Address dstIp = GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
+                Ipv4Address nhIp  = GetNodeIpv4Address(g_voegNodes->Get(nhId),  DATA_IF_INDEX);
+                sMsg << dstIp << " " << nhIp << " ";
+            }
 
             Ptr<Node> targetNode = g_voegNodes->Get(srcId);
-
             Simulator::Schedule(
                 Seconds(srcId * CONTROLLER_SEND_OFFSET),
-                &SdnControllerApp::SendRoutePacket,
-                this,
-                targetNode,
-                msg);
+                &SdnControllerApp::SendRoutePacket, this, targetNode, sMsg.str());
         }
-    }
-    else
-    {
-              // ---------------------------------------
-            // FULL VOEG: Multi-slot + EG-Dijkstra
-            // ---------------------------------------
-            int numSlots = static_cast<int>(PREDICTION_HORIZON / TIME_SLOT_DURATION);
 
+        // --------------------------------------------------------------------
+        // Step 3: If prediction enabled, build full prediction graph and send
+        //         P messages (VoEG fallback cache) via EG-Dijkstra
+        // --------------------------------------------------------------------
+        if (m_enablePrediction)
+        {
+            int numSlots = static_cast<int>(PREDICTION_HORIZON / TIME_SLOT_DURATION);
             std::vector<TimeSlotGraph> eg;
             BuildEvolvingGraph(eg, numSlots);
-
-            int baseSlot = static_cast<int>(
-                Simulator::Now().GetSeconds() / TIME_SLOT_DURATION);
 
             for (uint32_t srcId = 0; srcId < g_voegNodes->GetN(); ++srcId)
             {
                 if (srcId == g_controllerId) continue;
 
                 auto journeys = RunEGDijkstra(srcId, eg, baseSlot);
-
                 if (journeys.empty()) continue;
 
-                std::ostringstream sMsg;
                 std::ostringstream pMsg;
-
-                sMsg << "S ";
                 pMsg << "P ";
-
                 for (auto& [dstId, slotMap] : journeys)
                 {
                     if (slotMap.empty()) continue;
-
                     Ipv4Address dstIp =
                         GetNodeIpv4Address(g_voegNodes->Get(dstId), DATA_IF_INDEX);
-
-                    // ---- S message = earliest hop ----
-                    auto firstEntry = *slotMap.begin();
-                    int earliestSlot = firstEntry.first;
-                    uint32_t firstHopId = firstEntry.second;
-
-                    Ipv4Address firstHopIp =
-                        GetNodeIpv4Address(g_voegNodes->Get(firstHopId), DATA_IF_INDEX);
-
-                    sMsg << dstIp << " " << firstHopIp << " ";
-
-                    // ---- P message = all future hops ----
                     for (auto& [slot, nextHopId] : slotMap)
                     {
                         Ipv4Address nhIp =
                             GetNodeIpv4Address(g_voegNodes->Get(nextHopId), DATA_IF_INDEX);
-
-                        pMsg << slot << " "
-                            << dstIp << " "
-                            << nhIp << " ";
+                        pMsg << slot << " " << dstIp << " " << nhIp << " ";
                     }
-                    g_totalPathLength += slotMap.size();
-                    g_totalPaths++;
-                }
-                Ptr<Node> targetNode = g_voegNodes->Get(srcId);
-
-                if (!sMsg.str().empty())
-                {
-                    Simulator::Schedule(
-                        Seconds(srcId * CONTROLLER_SEND_OFFSET),
-                        &SdnControllerApp::SendRoutePacket,
-                        this,
-                        targetNode,
-                        sMsg.str());
                 }
 
-                if (!pMsg.str().empty())
+                if (pMsg.str() != "P ")
                 {
+                    Ptr<Node> targetNode = g_voegNodes->Get(srcId);
                     Simulator::Schedule(
                         Seconds(srcId * CONTROLLER_SEND_OFFSET + PREDICTION_MESSAGE_OFFSET),
-                        &SdnControllerApp::SendRoutePacket,
-                        this,
-                        targetNode,
-                        pMsg.str());
+                        &SdnControllerApp::SendRoutePacket, this, targetNode, pMsg.str());
                 }
             }
         }
+
         m_routeEvent = Simulator::Schedule(
             Seconds(ROUTE_RECOMPUTE_INTERVAL),
             &SdnControllerApp::RecomputeRoutes, this);
