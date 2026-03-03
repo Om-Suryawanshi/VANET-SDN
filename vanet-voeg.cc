@@ -12,7 +12,6 @@
 #include "ns3/netanim-module.h"
 #include "ns3/ipv4-static-routing-helper.h"
 #include "ns3/ipv4-list-routing-helper.h"
-#include "ns3/olsr-module.h"
 
 #include <vector>
 #include <map>
@@ -963,7 +962,7 @@ int main(int argc, char* argv[])
     NetDeviceContainer devCtrlNode = wifiCtrl.Install(phyCtrl, macCtrl, controller);
 
     // --------------------------------------------------------------------------
-    //  Routing: Static (SDN routes, priority 100) + OLSR fallback (priority 10)
+    //  Routing: Static (SDN routes, priority 100)
     // --------------------------------------------------------------------------
     InternetStackHelper     stack;
     Ipv4ListRoutingHelper   list;
