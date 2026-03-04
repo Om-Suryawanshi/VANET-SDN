@@ -13,7 +13,7 @@ if [[ ! "$SCENARIO" =~ ^(grid|highway|city|all)$ ]]; then
 fi
 
 SPEEDS=(5 10 15 20)
-NUM_VEHICLES=60
+NUM_VEHICLES=40
 SIM_TIME=300
 
 # Added "extra_args" to handle the differences between city/grid and highway

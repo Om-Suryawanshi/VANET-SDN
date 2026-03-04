@@ -112,12 +112,15 @@ const double JITTER_MULTIPLIER = 0.002;
 const double ROUTE_UPDATE_INTERVAL = 0.5;      // How often vehicles update routing table from journey
 
 // === VOEG PARAMETERS ===
-const double PREDICTION_HORIZON = 20.0;        // Time slots to predict ahead old 25 then 10 now 70
+const double PREDICTION_HORIZON = 15.0;        // Time slots to predict ahead old 25
 const double TIME_SLOT_DURATION = 0.5;         // Seconds per time slot
 const double TRANSMISSION_RANGE = 250.0;       // Meters Old 250
 const double TRANSMISSION_DELAY = 0.01;        // Seconds per hop (unused: placeholder)
 const double MIN_LINK_RELIABILITY = 0.1;       // Threshold for valid links
-const int    MSG_PREDICTION_SLOTS = 10;         // Future time slots included in each route message old 3
+const int    MSG_PREDICTION_SLOTS = 3;         // Future time slots included in each route message old 3
+const int    PREDICTION_WINDOW_BACK  = 3;   // slots allowed behind current
+const int    PREDICTION_WINDOW_FRONT = MSG_PREDICTION_SLOTS;
+const int    SLOT_TOLERANCE = 2;
 // Note: TIME_SLOT_DURATION is used as a divisor; must remain positive.
 
 // === DISTANCE THRESHOLDS (meters) ===
@@ -169,6 +172,12 @@ uint32_t g_totalPaths = 0;
 uint32_t g_totalInstalledRoutes = 0;
 uint32_t g_totalRouteSamples = 0;
 double g_firstPredictionActivation = -1.0;
+
+
+// === DEBUG FILE ===
+std::ofstream g_routeDebugFile;
+
+
 // ============================================================================
 //                      VOEG DATA STRUCTURES
 // ============================================================================
@@ -547,10 +556,31 @@ private:
             // Prediction cache update — store but do NOT install while controller is alive
             int timeSlot;
             std::string dstStr, nhStr;
-            while (ss >> timeSlot >> dstStr >> nhStr) {
+
+            while (ss >> timeSlot >> dstStr >> nhStr){
                 if (dstStr.find('.') == std::string::npos) continue;
-                m_predictionRoutes[Ipv4Address(dstStr.c_str())][timeSlot] =
-                    Ipv4Address(nhStr.c_str());
+
+                Ipv4Address dst(dstStr.c_str());
+                Ipv4Address nh(nhStr.c_str());
+
+                auto& slotMap = m_predictionRoutes[dst];
+
+                slotMap[timeSlot] = nh;
+
+                // ---- Sliding window pruning ----
+                double now = Simulator::Now().GetSeconds();
+                int currentSlot = static_cast<int>(now / TIME_SLOT_DURATION);
+
+                int minSlot = currentSlot - PREDICTION_WINDOW_BACK;
+                int maxSlot = currentSlot + PREDICTION_WINDOW_FRONT;
+
+                for (auto it = slotMap.begin(); it != slotMap.end(); )
+                {
+                    if (it->first < minSlot || it->first > maxSlot)
+                        it = slotMap.erase(it);
+                    else
+                        ++it;
+                }
             }
         }
     }
@@ -574,26 +604,52 @@ private:
             return;
         }
 
-        for (auto& [dst, slotMap] : m_predictionRoutes) {
-            // Find the closest slot entry at or before currentSlot.
-            auto it = slotMap.upper_bound(currentSlot);
-            if (it == slotMap.begin()) continue;
-            --it; // it->first <= currentSlot
+        for (auto& [dst, slotMap] : m_predictionRoutes)
+        {
+            Ipv4Address nh;
+            bool found = false;
+            auto it = slotMap.lower_bound(currentSlot - SLOT_TOLERANCE);
+            while (it != slotMap.end() && it->first <= currentSlot + SLOT_TOLERANCE)
+            {
+                nh = it->second;
+                g_cacheHits++;
+                found = true;
+                break;
+            }
 
-            Ipv4Address nh = it->second;
+            if (!found)
+            {
+                auto past = slotMap.upper_bound(currentSlot);
 
-            if (it->first < currentSlot) g_cacheHits++;
-            else                         g_cacheMisses++;
+                if (past == slotMap.begin())
+                    continue;
 
-            for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+                --past;
+                nh = past->second;
+                g_cacheMisses++;
+            }
+
+            // Remove old route
+            for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--)
+            {
                 Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+
                 if (route.GetDest() == dst &&
                     route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
-                    route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                    route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) ==
+                    Ipv4Address("10.1.0.0"))
+                {
                     staticRouting->RemoveRoute(i-1);
                 }
             }
+
+            // Install predicted route
             staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+            g_routeDebugFile
+                << Simulator::Now().GetSeconds() << ","
+                << GetNode()->GetId() << ","
+                << dst << ","
+                << nh << ",PREDICTION\n";
         }
 
         m_routeUpdateEvent = Simulator::Schedule(
@@ -622,16 +678,6 @@ private:
         }
         return nullptr;
     }
-
-    // Purge all SDN host routes and reinstall from m_activeRoutes.
-    // void InstallActiveRoutes() {
-    //     Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
-    //     if (!staticRouting) return;
-    //     PurgeSDNRoutes(staticRouting);
-    //     for (auto& [dst, nh] : m_activeRoutes) {
-    //         staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
-    //     }
-    // }
 
     void InstallActiveRoutes() {
         Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
@@ -685,8 +731,16 @@ private:
             // Add new route if it didn’t exist or was removed
             if (!routeExists || needsUpdate) {
                 staticRouting->AddHostRouteTo(dst, newNh, m_dataIfIndex, 0);
+                g_routeDebugFile
+                    << Simulator::Now().GetSeconds() << ","
+                    << GetNode()->GetId() << ","
+                    << dst << ","
+                    << newNh << ",SDN\n";
             }
         }
+
+
+
         g_totalInstalledRoutes += m_activeRoutes.size();
         g_totalRouteSamples++;
     }
@@ -758,7 +812,7 @@ private:
         m_recvSocket->SetRecvCallback(
             MakeCallback(&SdnControllerApp::ReceiveReport, this));
         m_routeEvent = Simulator::Schedule(
-            Seconds(2.0), &SdnControllerApp::RecomputeRoutes, this); // Seconds(CONTROLLER_START_TIME)
+            Seconds(CONTROLLER_START_TIME), &SdnControllerApp::RecomputeRoutes, this); // Seconds(CONTROLLER_START_TIME)
     }
 
     virtual void StopApplication() {
@@ -888,6 +942,25 @@ private:
     void RecomputeRoutes()
     {
         if (!g_voegNodes) return;
+        double now = Simulator::Now().GetSeconds();
+        static bool logged = false;
+        
+        if (g_failureStartTime >= 0 &&
+            now >= g_failureStartTime &&
+            now <= (g_failureStartTime + g_failureDuration))
+        {
+            // Controller is offline — skip route computation
+            if (!logged)
+            {
+                logged = true;
+                std::cout << "Controller faulure active" << std::endl;
+            }
+            m_routeEvent = Simulator::Schedule(
+                Seconds(ROUTE_RECOMPUTE_INTERVAL),
+                &SdnControllerApp::RecomputeRoutes,
+                this);
+            return;
+        }
 
         if (!m_enablePrediction)
         {
@@ -983,15 +1056,15 @@ private:
 
                     nextHop[dst] = curr;
                 }
-                if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
-                {
-                    if (nextHop.find(0) == nextHop.end())
-                    {
-                        std::cout << "[" << Simulator::Now().GetSeconds()
-                                << "s] NO PATH from "
-                                << srcId << " to 0\n";
-                    }
-                }
+                // if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
+                // {
+                //     if (nextHop.find(0) == nextHop.end())
+                //     {
+                //         std::cout << "[" << Simulator::Now().GetSeconds()
+                //                 << "s] NO PATH from "
+                //                 << srcId << " to 0\n";
+                //     }
+                // }
 
                 if (nextHop.empty())
                     continue;
@@ -1143,7 +1216,7 @@ int main(int argc, char* argv[])
     std::string traceFile             = "";
     std::string outputDir             = ".";
     double      simTime               = 150.0;
-    uint32_t    numNodes              = 60;
+    uint32_t    numNodes              = 40;
     bool        enableNetAnim         = false;
     bool        enableFailure         = false;
     bool        enablePredictionCache = false;
@@ -1177,10 +1250,14 @@ int main(int argc, char* argv[])
         traceFile = "scratch/mobility/" + scenario + "/mobility_" + std::to_string(speed) + ".tcl";
     }
 
-    std::string xmlFileName  = outputDir + "/result_VOEG_"      + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
-    std::string csvFileName  = outputDir + "/pdr_graph_VOEG_"   + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string cachFileName = outputDir + "/cache_status_VOEG_"+ scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string animFileName = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string xmlFileName        = outputDir + "/result_VOEG_"      + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string csvFileName        = outputDir + "/pdr_graph_VOEG_"   + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string cachFileName       = outputDir + "/cache_status_VOEG_"+ scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string animFileName       = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string routeDebugFileName = outputDir + "/route_debug_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+
+    g_routeDebugFile.open(routeDebugFileName);
+    g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
 
     RngSeedManager::SetSeed(3 + runId);
     RngSeedManager::SetRun(runId);
@@ -1406,8 +1483,11 @@ int main(int argc, char* argv[])
             // ---- Failure → Prediction Delay ----
             if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
             {
-                double activationDelay =
-                    g_firstPredictionActivation - g_failureStartTime;
+                double activationDelay = 0;
+                if (g_firstPredictionActivation >= g_failureStartTime)
+                {
+                    activationDelay = g_firstPredictionActivation - g_failureStartTime;
+                }
 
                 finalStats << "Failure to Prediction Activation Delay: "
                         << activationDelay << " s\n";
