@@ -215,7 +215,7 @@ void MonitorTxCallback(Ptr<const Packet> p)
                 << node->GetId() << ","
                 << route.GetDest() << ","
                 << currentGw << ","
-                << src << ",USED\n";
+                << src << "\n";
 
             break;
         }
