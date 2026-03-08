@@ -554,6 +554,7 @@ private:
         Simulator::Cancel(m_heartbeatEvent);
         Simulator::Cancel(m_routeUpdateEvent);
         if (m_ctrlRx) m_ctrlRx->Close();
+        if (m_reportSocket) m_reportSocket->Close();
     }
 
     // Send position + velocity report to controller
