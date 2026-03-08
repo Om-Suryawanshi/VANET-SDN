@@ -1431,8 +1431,10 @@ int main(int argc, char* argv[])
     std::string animFileName       = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
     std::string routeDebugFileName = outputDir + "/route_debug_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
 
-    g_routeDebugFile.open(routeDebugFileName);
-    g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
+    if (g_enableRouteLogging) {
+        g_routeDebugFile.open(routeDebugFileName);
+        g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
+    }
 
     RngSeedManager::SetSeed(3 + runId);
     RngSeedManager::SetRun(runId);
