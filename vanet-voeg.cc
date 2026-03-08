@@ -123,6 +123,12 @@ double g_firstPredictionActivation = -1.0;
 // === DEBUG FILE ===
 std::ofstream g_routeDebugFile;
 
+// Gate per-packet route logging; default off to avoid overhead with large packet counts
+bool g_enableRouteLogging = false;
+
+// Tracks last known next-hop per (nodeId, destination) to detect route changes
+std::map<uint32_t, std::map<Ipv4Address, Ipv4Address>> g_lastRouteGateway;
+
 // Used for logging like IP and SDN or Prediction
 std::map<uint32_t, std::map<Ipv4Address, std::string>> g_routeSource;
 
@@ -151,10 +157,11 @@ struct VehicleState {
 void MonitorTxCallback(Ptr<const Packet> p)
 {
     g_pdrTxTotal++;
-    double now = Simulator::Now().GetSeconds();
 
-    // if (now < g_failureStartTime || now > g_failureStartTime + g_failureDuration)
-    //     return;
+    // Route-logging is opt-in (--enableRouteLogging) to avoid overhead with
+    // large packet counts.  Even when enabled, only log when the active
+    // next-hop for a destination changes, not on every transmitted packet.
+    if (!g_enableRouteLogging) return;
 
     Ptr<Node> node = Simulator::GetContext() ?
         NodeList::GetNode(Simulator::GetContext()) : nullptr;
@@ -166,6 +173,8 @@ void MonitorTxCallback(Ptr<const Packet> p)
     Ptr<Ipv4StaticRouting> staticRouting;
     Ptr<Ipv4ListRouting> lr =
         DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+
+    if (!lr) return;
 
     int16_t priority;
     for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++)
@@ -183,23 +192,22 @@ void MonitorTxCallback(Ptr<const Packet> p)
     {
         Ipv4RoutingTableEntry route = staticRouting->GetRoute(i);
 
-        // if (route.GetDest() == Ipv4Address("10.1.0.1"))
         if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0"))
         {
-            std::string src = "UNKNOWN";
+            Ipv4Address currentGw = route.GetGateway();
+            Ipv4Address& lastGw   = g_lastRouteGateway[node->GetId()][route.GetDest()];
 
+            // Only write a record when the gateway has changed
+            if (currentGw == lastGw) continue;
+            lastGw = currentGw;
+
+            std::string src = "UNKNOWN";
             auto nodeIt = g_routeSource.find(node->GetId());
             if (nodeIt != g_routeSource.end())
             {
                 auto routeIt = nodeIt->second.find(route.GetDest());
                 if (routeIt != nodeIt->second.end())
                     src = routeIt->second;
-            }
-
-            if (src == "UNKNOWN")
-            {
-                std::cout << "[WARN] Unknown route source for node "
-                        << node->GetId() << std::endl;
             }
 
             g_routeDebugFile
@@ -1400,6 +1408,7 @@ int main(int argc, char* argv[])
     cmd.AddValue("randomFlows",           "Randomize client/server pairs",              randomFlows);
     cmd.AddValue("multiFlows",            "Enable multiple concurrent flows",           multiFlows);
     cmd.AddValue("numFlows",              "Number of concurrent flows (multiFlows)",    numFlows);
+    cmd.AddValue("enableRouteLogging",    "Log route changes to route_debug CSV",       g_enableRouteLogging);
     cmd.Parse(argc, argv);
 
     // If failure flag is set but no time specified, use defaults
@@ -1421,8 +1430,10 @@ int main(int argc, char* argv[])
     std::string animFileName       = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
     std::string routeDebugFileName = outputDir + "/route_debug_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
 
-    g_routeDebugFile.open(routeDebugFileName);
-    g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
+    if (g_enableRouteLogging) {
+        g_routeDebugFile.open(routeDebugFileName);
+        g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
+    }
 
     RngSeedManager::SetSeed(3 + runId);
     RngSeedManager::SetRun(runId);
