@@ -46,60 +46,6 @@ uint64_t g_pdrRxLast = 0;       // Last recorded Rx (for per-interval calculatio
 uint32_t g_cacheHits = 0;
 uint32_t g_cacheMisses = 0;
 
-void MonitorTxCallback(Ptr<const Packet> p) { g_pdrTxTotal++; }
-void MonitorRxCallback(Ptr<const Packet> p) { g_pdrRxTotal++; }
-
-void RecordPdrPerSecond(std::string filename) {
-    static std::ofstream file;
-    static double currentTime = 0;
-    if (!file.is_open()) {
-        file.open(filename.c_str(), std::ios::out);
-        file << "Time,PDR,Tx,Rx,CumulativePDR" << std::endl;
-    }
-    
-    uint64_t intervalTx = g_pdrTxTotal - g_pdrTxLast;
-    uint64_t intervalRx = g_pdrRxTotal - g_pdrRxLast;
-    
-    double intervalPdr = 0.0;
-    if (intervalTx > 0) {
-        intervalPdr = std::min(100.0, (double)intervalRx / intervalTx * 100.0);
-    } else if (intervalRx > 0) {
-        intervalPdr = (g_pdrTxTotal > 0) ? std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0) : 0.0;
-    }
-    
-    double cumulativePdr = 0.0;
-    if (g_pdrTxTotal > 0) {
-        cumulativePdr = std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0);
-    }
-    
-    file << currentTime << "," 
-         << intervalPdr << "," 
-         << intervalTx << "," 
-         << intervalRx << ","
-         << cumulativePdr << std::endl;
-    
-    // Update last recorded values
-    g_pdrTxLast = g_pdrTxTotal;
-    g_pdrRxLast = g_pdrRxTotal;
-    
-    currentTime += 1.0;
-    Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, filename);
-}
-
-
-void RecordCacheStatus(std::string filename) {
-    static std::ofstream file;
-    static double currentTime = 0;
-    if (!file.is_open()) {
-        file.open(filename.c_str(), std::ios::out);
-        file << "Time,CacheHits,CacheMisses" << std::endl;
-    }
-    file << currentTime << "," << g_cacheHits << "," << g_cacheMisses << std::endl;
-    g_cacheHits = 0;
-    g_cacheMisses = 0;
-    currentTime += 1.0;
-    Simulator::Schedule(Seconds(1.0), &RecordCacheStatus, filename);
-}
 
 // ============================================================================
 //                      CONFIGURATION CONSTANTS
@@ -112,12 +58,12 @@ const double JITTER_MULTIPLIER = 0.002;
 const double ROUTE_UPDATE_INTERVAL = 0.5;      // How often vehicles update routing table from journey
 
 // === VOEG PARAMETERS ===
-const double PREDICTION_HORIZON = 15.0;        // Time slots to predict ahead old 25
+const double PREDICTION_HORIZON = 40.0;        // Time slots to predict ahead old 25
 const double TIME_SLOT_DURATION = 0.5;         // Seconds per time slot
 const double TRANSMISSION_RANGE = 250.0;       // Meters Old 250
 const double TRANSMISSION_DELAY = 0.01;        // Seconds per hop (unused: placeholder)
 const double MIN_LINK_RELIABILITY = 0.1;       // Threshold for valid links
-const int    MSG_PREDICTION_SLOTS = 3;         // Future time slots included in each route message old 3
+const int    MSG_PREDICTION_SLOTS = 40;         // Future time slots included in each route message old 3
 const int    PREDICTION_WINDOW_BACK  = 3;   // slots allowed behind current
 const int    PREDICTION_WINDOW_FRONT = MSG_PREDICTION_SLOTS;
 const int    SLOT_TOLERANCE = 2;
@@ -177,6 +123,8 @@ double g_firstPredictionActivation = -1.0;
 // === DEBUG FILE ===
 std::ofstream g_routeDebugFile;
 
+// Used for logging like IP and SDN or Prediction
+std::map<uint32_t, std::map<Ipv4Address, std::string>> g_routeSource;
 
 // ============================================================================
 //                      VOEG DATA STRUCTURES
@@ -195,6 +143,129 @@ struct VehicleState {
     Vector   position;
     Vector   velocity;
 };
+
+// ==========================================================================
+//                      FUNCTIONS
+// ==========================================================================
+
+void MonitorTxCallback(Ptr<const Packet> p)
+{
+    g_pdrTxTotal++;
+    double now = Simulator::Now().GetSeconds();
+
+    // if (now < g_failureStartTime || now > g_failureStartTime + g_failureDuration)
+    //     return;
+
+    Ptr<Node> node = Simulator::GetContext() ?
+        NodeList::GetNode(Simulator::GetContext()) : nullptr;
+
+    if (!node) return;
+
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+
+    Ptr<Ipv4StaticRouting> staticRouting;
+    Ptr<Ipv4ListRouting> lr =
+        DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+
+    int16_t priority;
+    for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++)
+    {
+        Ptr<Ipv4RoutingProtocol> proto =
+            lr->GetRoutingProtocol(i, priority);
+
+        staticRouting = DynamicCast<Ipv4StaticRouting>(proto);
+        if (staticRouting) break;
+    }
+
+    if (!staticRouting) return;
+
+    for (uint32_t i = 0; i < staticRouting->GetNRoutes(); i++)
+    {
+        Ipv4RoutingTableEntry route = staticRouting->GetRoute(i);
+
+        // if (route.GetDest() == Ipv4Address("10.1.0.1"))
+        if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0"))
+        {
+            std::string src = "UNKNOWN";
+
+            auto nodeIt = g_routeSource.find(node->GetId());
+            if (nodeIt != g_routeSource.end())
+            {
+                auto routeIt = nodeIt->second.find(route.GetDest());
+                if (routeIt != nodeIt->second.end())
+                    src = routeIt->second;
+            }
+
+            if (src == "UNKNOWN")
+            {
+                std::cout << "[WARN] Unknown route source for node "
+                        << node->GetId() << std::endl;
+            }
+
+            g_routeDebugFile
+                << Simulator::Now().GetSeconds() << ","
+                << node->GetId() << ","
+                << route.GetDest() << ","
+                << route.GetGateway() << ","
+                << src << ",USED\n";
+
+            break;
+        }
+    }
+}
+void MonitorRxCallback(Ptr<const Packet> p) { g_pdrRxTotal++; }
+
+void RecordPdrPerSecond(std::string filename) {
+    static std::ofstream file;
+    static double currentTime = 0;
+    if (!file.is_open()) {
+        file.open(filename.c_str(), std::ios::out);
+        file << "Time,PDR,Tx,Rx,CumulativePDR" << std::endl;
+    }
+    
+    uint64_t intervalTx = g_pdrTxTotal - g_pdrTxLast;
+    uint64_t intervalRx = g_pdrRxTotal - g_pdrRxLast;
+    
+    double intervalPdr = 0.0;
+    if (intervalTx > 0) {
+        intervalPdr = std::min(100.0, (double)intervalRx / intervalTx * 100.0);
+    } else if (intervalRx > 0) {
+        intervalPdr = (g_pdrTxTotal > 0) ? std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0) : 0.0;
+    }
+    
+    double cumulativePdr = 0.0;
+    if (g_pdrTxTotal > 0) {
+        cumulativePdr = std::min(100.0, (double)g_pdrRxTotal / g_pdrTxTotal * 100.0);
+    }
+    
+    file << currentTime << "," 
+         << intervalPdr << "," 
+         << intervalTx << "," 
+         << intervalRx << ","
+         << cumulativePdr << std::endl;
+    
+    // Update last recorded values
+    g_pdrTxLast = g_pdrTxTotal;
+    g_pdrRxLast = g_pdrRxTotal;
+    
+    currentTime += 1.0;
+    Simulator::Schedule(Seconds(1.0), &RecordPdrPerSecond, filename);
+}
+
+
+void RecordCacheStatus(std::string filename) {
+    static std::ofstream file;
+    static double currentTime = 0;
+    if (!file.is_open()) {
+        file.open(filename.c_str(), std::ios::out);
+        file << "Time,CacheHits,CacheMisses" << std::endl;
+    }
+    file << currentTime << "," << g_cacheHits << "," << g_cacheMisses << std::endl;
+    g_cacheHits = 0;
+    g_cacheMisses = 0;
+    currentTime += 1.0;
+    Simulator::Schedule(Seconds(1.0), &RecordCacheStatus, filename);
+}
 
 // ============================================================================
 //                      LINK RELIABILITY CALCULATION
@@ -444,8 +515,6 @@ public:
     }
 
 private:
-    Ptr<Socket> m_reportSocket;
-
     virtual void StartApplication() {
         // Reset last-contact time to now so we don't immediately time out
         m_lastControllerContact = Simulator::Now();
@@ -545,6 +614,12 @@ private:
                 NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
                               << GetNode()->GetId()
                               << ": Controller reconnected! Switching back to SDN routing");
+                std::cout << "[MODE] Node "
+                            << GetNode()->GetId()
+                            << " using "
+                            << (m_usingSdnRouting ? "SDN" : "PRED")
+                            << " at " << Simulator::Now().GetSeconds()
+                            << "s\n";
             }
             std::string dstStr, nhStr;
             while (ss >> dstStr >> nhStr) {
@@ -606,6 +681,12 @@ private:
 
         for (auto& [dst, slotMap] : m_predictionRoutes)
         {
+            if (m_predictionRoutes.empty())
+            {
+                std::cout << "[WARN] Node " << GetNode()->GetId()
+                        << " prediction cache empty\n";
+            }
+            
             Ipv4Address nh;
             bool found = false;
             auto it = slotMap.lower_bound(currentSlot - SLOT_TOLERANCE);
@@ -643,8 +724,17 @@ private:
                 }
             }
 
+            // DEBUG: log prediction route choice
+            std::cout << "[PRED ROUTE] node "
+                    << GetNode()->GetId()
+                    << " dst " << dst
+                    << " via " << nh
+                    << " slot " << currentSlot
+                    << std::endl;
+
             // Install predicted route
             staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+            g_routeSource[GetNode()->GetId()][dst] = "PREDICTION";
             g_routeDebugFile
                 << Simulator::Now().GetSeconds() << ","
                 << GetNode()->GetId() << ","
@@ -731,6 +821,7 @@ private:
             // Add new route if it didn’t exist or was removed
             if (!routeExists || needsUpdate) {
                 staticRouting->AddHostRouteTo(dst, newNh, m_dataIfIndex, 0);
+                g_routeSource[GetNode()->GetId()][dst] = "SDN";
                 g_routeDebugFile
                     << Simulator::Now().GetSeconds() << ","
                     << GetNode()->GetId() << ","
@@ -753,6 +844,13 @@ private:
                           << ": Controller timeout (" << timeSince
                           << "s)! Switching to prediction routing");
             m_usingSdnRouting = false;
+            std::cout << "[MODE] Node "
+                    << GetNode()->GetId()
+                    << " using "
+                    << (m_usingSdnRouting ? "SDN" : "PRED")
+                    << " at " << Simulator::Now().GetSeconds()
+                    << "s\n";
+
             if (g_firstPredictionActivation < 0)
             {
                 g_firstPredictionActivation = Simulator::Now().GetSeconds();
@@ -760,6 +858,7 @@ private:
             Simulator::Cancel(m_routeUpdateEvent);
             if (m_enablePredictionCache && !m_predictionRoutes.empty()) {
                 NS_LOG_UNCOND("  Using VoEG prediction cache for continued routing");
+                std::cout << "Prediction routes available: " << m_predictionRoutes.size() << std::endl;
             } else {
                 NS_LOG_UNCOND("  Controller down — no prediction routes available");
             }
@@ -777,6 +876,8 @@ private:
     bool        m_usingSdnRouting;
     bool        m_enablePredictionCache;
     Time        m_lastControllerContact;
+    
+    Ptr<Socket> m_reportSocket;
 
     // Active SDN routes (installed while controller is reachable): dst -> next-hop
     std::map<Ipv4Address, Ipv4Address> m_activeRoutes;
@@ -1203,6 +1304,65 @@ private:
     uint32_t                          m_ctrlIfIndex;
 };
 
+// Helper for installing nodes
+void InstallTrafficFlows(
+    NodeContainer& vehicles,
+    Ipv4InterfaceContainer& ifData,
+    uint32_t numFlows,
+    bool randomPairs,
+    double simTime)
+{
+    Ptr<UniformRandomVariable> rand = CreateObject<UniformRandomVariable>();
+
+    std::set<std::pair<uint32_t,uint32_t>> usedPairs;
+
+    for (uint32_t i = 0; i < numFlows; i++)
+    {
+        uint32_t src;
+        uint32_t dst;
+
+        if (randomPairs)
+        {
+            do
+            {
+                src = rand->GetInteger(0, vehicles.GetN()-1);
+                dst = rand->GetInteger(0, vehicles.GetN()-1);
+            }
+            while (src == dst || usedPairs.count({src,dst}));
+        }
+        else
+        {
+            src = vehicles.GetN()-1-i;
+            dst = i;
+        }
+
+        usedPairs.insert({src,dst});
+
+        uint16_t port = DATA_APP_PORT + i;
+
+        UdpEchoServerHelper server(port);
+        auto serverApps = server.Install(vehicles.Get(dst));
+        serverApps.Start(Seconds(SERVER_START_TIME));
+        serverApps.Stop(Seconds(simTime));
+
+        UdpEchoClientHelper client(ifData.GetAddress(dst), port);
+        client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
+        client.SetAttribute("Interval", TimeValue(Seconds(PACKET_INTERVAL)));
+        client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
+
+        auto clientApps = client.Install(vehicles.Get(src));
+
+        Ptr<UniformRandomVariable> jitter = CreateObject<UniformRandomVariable>();
+        double start = CLIENT_START_TIME + jitter->GetValue(0.0,0.2);
+        clientApps.Start(Seconds(start));
+        clientApps.Stop(Seconds(simTime));
+
+        std::cout << "Flow " << i
+                  << " : Node " << src
+                  << " → Node " << dst << std::endl;
+    }
+}
+
 // ============================================================================
 //                                MAIN
 // ============================================================================
@@ -1222,19 +1382,25 @@ int main(int argc, char* argv[])
     bool        enablePredictionCache = false;
     double      failureStart          = -1.0;
     double      failureDuration       = 0.0;
+    bool        randomFlows           = false;
+    bool        multiFlows            = false;
+    uint32_t    numFlows              = 5;
 
     CommandLine cmd;
-    cmd.AddValue("protocol",              "Protocol (VOEG)",                           protocol);
-    cmd.AddValue("scenario",              "Simulation scenario (grid/highway/city)",   scenario);
-    cmd.AddValue("speed",                 "Vehicle speed for mobility file selection", speed);
-    cmd.AddValue("runId",                 "Simulation run ID",                         runId);
-    cmd.AddValue("traceFile",             "Path to mobility trace file",               traceFile);
-    cmd.AddValue("outputDir",             "Output directory for results",              outputDir);
-    cmd.AddValue("netanim",               "Enable NetAnim output",                     enableNetAnim);
-    cmd.AddValue("enableFailure",         "Enable controller failure simulation",      enableFailure);
-    cmd.AddValue("enablePredictionCache", "Enable local route caching",                enablePredictionCache);
-    cmd.AddValue("failureStart",          "Controller failure start time (-1=disabled)", failureStart);
-    cmd.AddValue("failureDuration",       "Controller failure duration in seconds",    failureDuration);
+    cmd.AddValue("protocol",              "Protocol (VOEG)",                            protocol);
+    cmd.AddValue("scenario",              "Simulation scenario (grid/highway/city)",    scenario);
+    cmd.AddValue("speed",                 "Vehicle speed for mobility file selection",  speed);
+    cmd.AddValue("runId",                 "Simulation run ID",                          runId);
+    cmd.AddValue("traceFile",             "Path to mobility trace file",                traceFile);
+    cmd.AddValue("outputDir",             "Output directory for results",               outputDir);
+    cmd.AddValue("netanim",               "Enable NetAnim output",                      enableNetAnim);
+    cmd.AddValue("enableFailure",         "Enable controller failure simulation",       enableFailure);
+    cmd.AddValue("enablePredictionCache", "Enable local route caching",                 enablePredictionCache);
+    cmd.AddValue("failureStart",          "Controller failure start time (-1=disabled)",failureStart);
+    cmd.AddValue("failureDuration",       "Controller failure duration in seconds",     failureDuration);
+    cmd.AddValue("randomFlows",           "Randomize client/server pairs",              randomFlows);
+    cmd.AddValue("multiFlows",            "Enable multiple concurrent flows",           multiFlows);
+    cmd.AddValue("numFlows",              "Number of concurrent flows (multiFlows)",    numFlows);
     cmd.Parse(argc, argv);
 
     // If failure flag is set but no time specified, use defaults
@@ -1375,19 +1541,30 @@ int main(int argc, char* argv[])
         app->SetStopTime(Seconds(simTime));
     }
 
-    // Data application: echo client (vehicle N-1) → echo server (vehicle 0)
-    UdpEchoServerHelper server(DATA_APP_PORT);
-    ApplicationContainer serverApps = server.Install(vehicles.Get(0));
-    serverApps.Start(Seconds(SERVER_START_TIME));
-    serverApps.Stop(Seconds(simTime));
+    if (multiFlows)
+    {
+        InstallTrafficFlows(vehicles, ifData, numFlows, randomFlows, simTime);
+    }
+    else if (randomFlows)
+    {
+        InstallTrafficFlows(vehicles, ifData, 1, true, simTime);
+    }
+    else
+    {
+        // Data application: echo client (vehicle N-1) → echo server (vehicle 0)
+        UdpEchoServerHelper server(DATA_APP_PORT);
+        ApplicationContainer serverApps = server.Install(vehicles.Get(0));
+        serverApps.Start(Seconds(SERVER_START_TIME));
+        serverApps.Stop(Seconds(simTime));
 
-    UdpEchoClientHelper client(ifData.GetAddress(0), DATA_APP_PORT);
-    client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
-    client.SetAttribute("Interval",   TimeValue(Seconds(PACKET_INTERVAL)));
-    client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
-    ApplicationContainer clientApps = client.Install(vehicles.Get(numNodes - 1));
-    clientApps.Start(Seconds(CLIENT_START_TIME));
-    clientApps.Stop(Seconds(simTime));
+        UdpEchoClientHelper client(ifData.GetAddress(0), DATA_APP_PORT);
+        client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
+        client.SetAttribute("Interval",   TimeValue(Seconds(PACKET_INTERVAL)));
+        client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
+        ApplicationContainer clientApps = client.Install(vehicles.Get(numNodes - 1));
+        clientApps.Start(Seconds(CLIENT_START_TIME));
+        clientApps.Stop(Seconds(simTime));
+    }
 
     // --------------------------------------------------------------------------
     //  FlowMonitor
@@ -1434,70 +1611,81 @@ int main(int argc, char* argv[])
     // Updated Output: PDR, Throughput, and Delay
     std::ofstream finalStats(outputDir + "/final_stats_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".txt");
     
-    for (auto const& [flowId, flowStats] : stats) {
+    double totalTx = 0;
+    double totalRx = 0;
+
+    for (auto const& [flowId, flowStats] : stats)
+    {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
-        
-        // Only count data flows (port 9)
-        if (t.destinationPort == DATA_APP_PORT) {
-            
-            // 1. Packet Delivery Ratio (PDR)
-            double pdr = (flowStats.txPackets > 0) ? 
-                         std::min(100.0, 100.0 * flowStats.rxPackets / flowStats.txPackets) : 0.0;
-            
-            // 2. Throughput (in Kbps)
-            double throughput = 0.0;
-            double duration = (flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket).GetSeconds();
-            if (duration > 0 && flowStats.rxPackets > 0) {
-                // rxBytes * 8 bits / (duration in seconds * 1000) = Kbps
-                throughput = (flowStats.rxBytes * 8.0) / (duration * 1000.0);
-            }
-            // 3. Average End-to-End Delay (in ms)
-            double delay = 0.0;
-            if (flowStats.rxPackets > 0) {
-                delay = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000.0;
-            }
-            finalStats << "Flow ID     : " << flowId << "\n"
-                       << "Connection  : " << t.sourceAddress << " -> " << t.destinationAddress << "\n"
-                       << "Tx Packets  : " << flowStats.txPackets << "\n"
-                       << "Rx Packets  : " << flowStats.rxPackets << "\n"
-                       << "PDR         : " << pdr << " %\n"
-                       << "Throughput  : " << throughput << " kbps\n"
-                       << "Avg Delay   : " << delay << " ms\n"
-                       << "------------------------------------------------\n";
-            finalStats << "\n===== VOEG ADDITIONAL METRICS =====\n";
 
-            // ---- Average Path Length ----
-            double avgPathLen = (g_totalPaths > 0) ?
-                g_totalPathLength / g_totalPaths : 0.0;
+        // ---- Packet Delivery Ratio ----
+        double pdr = 0.0;
+        if (flowStats.txPackets > 0)
+            pdr = 100.0 * flowStats.rxPackets / flowStats.txPackets;
 
-            finalStats << "Average Path Length (hops): "
-                    << avgPathLen << "\n";
+        // ---- Throughput ----
+        double throughput = 0.0;
+        double duration =
+            (flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket).GetSeconds();
 
-            // ---- Avg SDN Routes Per Node ----
-            double avgRoutes = (g_totalRouteSamples > 0) ?
-                (double)g_totalInstalledRoutes / g_totalRouteSamples : 0.0;
+        if (duration > 0 && flowStats.rxPackets > 0)
+            throughput = (flowStats.rxBytes * 8.0) / (duration * 1000.0);
 
-            finalStats << "Average SDN Routes Installed per Node: "
-                    << avgRoutes << "\n";
+        // ---- Average Delay ----
+        double delay = 0.0;
+        if (flowStats.rxPackets > 0)
+            delay = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000.0;
 
-            // ---- Failure → Prediction Delay ----
-            if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
-            {
-                double activationDelay = 0;
-                if (g_firstPredictionActivation >= g_failureStartTime)
-                {
-                    activationDelay = g_firstPredictionActivation - g_failureStartTime;
-                }
+        finalStats << "Flow ID     : " << flowId << "\n"
+                << "Connection  : " << t.sourceAddress
+                << " -> " << t.destinationAddress << "\n"
+                << "Tx Packets  : " << flowStats.txPackets << "\n"
+                << "Rx Packets  : " << flowStats.rxPackets << "\n"
+                << "PDR         : " << pdr << " %\n"
+                << "Throughput  : " << throughput << " kbps\n"
+                << "Avg Delay   : " << delay << " ms\n"
+                << "------------------------------------------------\n";
 
-                finalStats << "Failure to Prediction Activation Delay: "
-                        << activationDelay << " s\n";
-            }
-            else
-            {
-                finalStats << "Failure to Prediction Activation Delay: N/A\n";
-            }
-        }
+        totalTx += flowStats.txPackets;
+        totalRx += flowStats.rxPackets;
     }
+    double overallPdr = (totalTx > 0) ? 100.0 * totalRx / totalTx : 0.0;
+
+    finalStats << "\n===== NETWORK TOTAL =====\n";
+    finalStats << "Total Tx Packets : " << totalTx << "\n";
+    finalStats << "Total Rx Packets : " << totalRx << "\n";
+    finalStats << "Overall PDR      : " << overallPdr << " %\n";
+
+    finalStats << "\n===== VOEG ADDITIONAL METRICS =====\n";
+
+    double avgPathLen = (g_totalPaths > 0)
+        ? g_totalPathLength / g_totalPaths : 0.0;
+
+    finalStats << "Average Path Length (hops): "
+            << avgPathLen << "\n";
+
+    double avgRoutes = (g_totalRouteSamples > 0)
+        ? (double)g_totalInstalledRoutes / g_totalRouteSamples : 0.0;
+
+    finalStats << "Average SDN Routes Installed per Node: "
+            << avgRoutes << "\n";
+
+    if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
+    {
+        double activationDelay = 0;
+
+        if (g_firstPredictionActivation >= g_failureStartTime)
+            activationDelay =
+                g_firstPredictionActivation - g_failureStartTime;
+
+        finalStats << "Failure to Prediction Activation Delay: "
+                << activationDelay << " s\n";
+    }
+    else
+    {
+        finalStats << "Failure to Prediction Activation Delay: N/A\n";
+    }
+    
     finalStats.close();
     Simulator::Destroy();
     return 0;
