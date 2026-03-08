@@ -679,14 +679,14 @@ private:
             return;
         }
 
+        if (m_predictionRoutes.empty())
+        {
+            std::cout << "[WARN] Node " << GetNode()->GetId()
+                    << " prediction cache empty\n";
+        }
+
         for (auto& [dst, slotMap] : m_predictionRoutes)
         {
-            if (m_predictionRoutes.empty())
-            {
-                std::cout << "[WARN] Node " << GetNode()->GetId()
-                        << " prediction cache empty\n";
-            }
-            
             Ipv4Address nh;
             bool found = false;
             auto it = slotMap.lower_bound(currentSlot - SLOT_TOLERANCE);
