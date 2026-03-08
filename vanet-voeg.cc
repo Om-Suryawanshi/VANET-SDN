@@ -148,6 +148,7 @@ struct VehicleState {
     uint32_t nodeId;
     Vector   position;
     Vector   velocity;
+    double   lastUpdate;
 };
 
 // ==========================================================================
@@ -959,7 +960,12 @@ private:
         // if (nodeId == 59 || nodeId == 0)
         //     std::cout << "Report from node " << nodeId << std::endl;
         
-        m_vehicleStates[nodeId] = { nodeId, Vector(x, y, 0), Vector(vx, vy, 0) };
+        m_vehicleStates[nodeId] = {
+            nodeId,
+            Vector(x, y, 0),
+            Vector(vx, vy, 0),
+            Simulator::Now().GetSeconds()
+        };
     }
 
     // Build VoEG: one TimeSlotGraph per prediction slot.
@@ -974,12 +980,25 @@ private:
         // Collect all node IDs once
         std::vector<uint32_t> ids;
         ids.reserve(m_vehicleStates.size());
+        double now = Simulator::Now().GetSeconds();
+
         for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i)
         {
-            if (i == g_controllerId) continue;
-            // Only include nodes that have reported at least once
-            if (m_vehicleStates.find(i) != m_vehicleStates.end())
-                ids.push_back(i);
+            if (i == g_controllerId)
+                continue;
+
+            auto it = m_vehicleStates.find(i);
+
+            if (it == m_vehicleStates.end())
+                continue;
+
+            double age = now - it->second.lastUpdate;
+
+            // Skip only if extremely stale
+            if (age > 3.0)
+                continue;
+
+            ids.push_back(i);
         }
 
         for (int s = 0; s < numSlots; ++s) {
@@ -990,6 +1009,9 @@ private:
             // Predicted positions at time slot s
             std::map<uint32_t, Vector> predPos;
             for (auto& [id, state] : m_vehicleStates) {
+                double age = now - state.lastUpdate;
+                if (age > 3.0) // ensure stale nodes aren't used
+                    continue;
                 predPos[id] = Vector(
                     state.position.x + state.velocity.x * tau,
                     state.position.y + state.velocity.y * tau,
