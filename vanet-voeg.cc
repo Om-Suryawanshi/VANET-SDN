@@ -46,7 +46,171 @@ uint64_t g_pdrRxLast = 0;       // Last recorded Rx (for per-interval calculatio
 uint32_t g_cacheHits = 0;
 uint32_t g_cacheMisses = 0;
 
-void MonitorTxCallback(Ptr<const Packet> p) { g_pdrTxTotal++; }
+
+// ============================================================================
+//                      CONFIGURATION CONSTANTS
+// ============================================================================
+// === TIMING PARAMETERS (seconds) ===
+const double REPORT_INTERVAL = 0.25;
+const double ROUTE_RECOMPUTE_INTERVAL = 0.5; // Old 0.25
+const double CONTROLLER_START_TIME = 0.2;
+const double JITTER_MULTIPLIER = 0.002;
+const double ROUTE_UPDATE_INTERVAL = 0.5;      // How often vehicles update routing table from journey
+
+// === VOEG PARAMETERS ===
+const double PREDICTION_HORIZON = 40.0;        // Time slots to predict ahead old 25
+const double TIME_SLOT_DURATION = 0.5;         // Seconds per time slot
+const double TRANSMISSION_RANGE = 250.0;       // Meters Old 250
+const double TRANSMISSION_DELAY = 0.01;        // Seconds per hop (unused: placeholder)
+const double MIN_LINK_RELIABILITY = 0.1;       // Threshold for valid links
+const int    MSG_PREDICTION_SLOTS = 40;         // Future time slots included in each route message old 3
+const int    PREDICTION_WINDOW_BACK  = 3;   // slots allowed behind current
+const int    PREDICTION_WINDOW_FRONT = MSG_PREDICTION_SLOTS;
+const int    SLOT_TOLERANCE = 2;
+// Note: TIME_SLOT_DURATION is used as a divisor; must remain positive.
+
+// === DISTANCE THRESHOLDS (meters) ===
+const double WIFI_DATA_MAX_RANGE = 350.0;
+const double WIFI_CTRL_MAX_RANGE = 15000.0;    // Entire map should be able to acess the controller
+
+// === NETWORK INTERFACE INDICES ===
+const uint32_t DATA_IF_INDEX = 1;
+const uint32_t CTRL_IF_INDEX = 2;
+const uint32_t CTRL_NODE_IF_INDEX = 1;
+
+// === UDP PORTS ===
+const uint16_t CONTROLLER_REPORT_PORT = 9999;
+const uint16_t VEHICLE_ROUTE_PORT = 10000;
+const uint16_t DATA_APP_PORT = 9;
+
+// === APPLICATION TIMING ===
+const double SERVER_START_TIME = 5.0;
+const double CLIENT_START_TIME = 10.0;
+const double VEHICLE_APP_START_OFFSET = 0.5;
+const double VEHICLE_APP_STAGGER = 0.01;
+
+// === SCHEDULING OFFSETS ===
+const double CONTROLLER_SEND_OFFSET      = 0.0005;
+const double PREDICTION_MESSAGE_OFFSET   = 0.0001; // Ensures P msg is sent after S msg per vehicle
+
+// === SPECIAL NODE IDs ===
+// const uint32_t CONTROLLER_NODE_ID = 50;
+uint32_t g_controllerId = 0;
+
+// === FAILURE RECOVERY ===
+const double CONTROLLER_TIMEOUT = 2.0;
+const double HEARTBEAT_CHECK_INTERVAL = 0.5;
+
+// === IP CONFIGURATION ===
+const char* DATA_NETWORK_PREFIX = "10.1.0.0";
+const char* DATA_NETWORK_MASK   = "255.255.0.0";
+const char* CTRL_NETWORK_PREFIX = "10.2.0.0";
+const char* CTRL_NETWORK_MASK   = "255.255.0.0";
+
+// === APPLICATION PARAMETERS ===
+const uint32_t MAX_PACKETS    = 100000;
+const double   PACKET_INTERVAL = 0.02; // Old 0.1
+const uint32_t PACKET_SIZE    = 1024;
+
+
+double g_totalPathLength = 0.0;
+uint32_t g_totalPaths = 0;
+uint32_t g_totalInstalledRoutes = 0;
+uint32_t g_totalRouteSamples = 0;
+double g_firstPredictionActivation = -1.0;
+
+
+// === DEBUG FILE ===
+std::ofstream g_routeDebugFile;
+
+// Used for logging like IP and SDN or Prediction
+std::map<uint32_t, std::map<Ipv4Address, std::string>> g_routeSource;
+
+// ============================================================================
+//                      VOEG DATA STRUCTURES
+// ============================================================================
+
+// Snapshot of the network topology at one predicted time slot
+struct TimeSlotGraph {
+    int timeSlot;
+    std::map<uint32_t, std::set<uint32_t>>            adjacency;       // node -> neighbors
+    std::map<std::pair<uint32_t,uint32_t>, double>    linkReliability; // (i,j) -> reliability
+};
+
+// Per-vehicle mobility state stored at the controller
+struct VehicleState {
+    uint32_t nodeId;
+    Vector   position;
+    Vector   velocity;
+};
+
+// ==========================================================================
+//                      FUNCTIONS
+// ==========================================================================
+
+void MonitorTxCallback(Ptr<const Packet> p)
+{
+    g_pdrTxTotal++;
+    double now = Simulator::Now().GetSeconds();
+
+    // if (now < g_failureStartTime || now > g_failureStartTime + g_failureDuration)
+    //     return;
+
+    Ptr<Node> node = Simulator::GetContext() ?
+        NodeList::GetNode(Simulator::GetContext()) : nullptr;
+
+    if (!node) return;
+
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+
+    Ptr<Ipv4StaticRouting> staticRouting;
+    Ptr<Ipv4ListRouting> lr =
+        DynamicCast<Ipv4ListRouting>(ipv4->GetRoutingProtocol());
+
+    int16_t priority;
+    for (uint32_t i = 0; i < lr->GetNRoutingProtocols(); i++)
+    {
+        Ptr<Ipv4RoutingProtocol> proto =
+            lr->GetRoutingProtocol(i, priority);
+
+        staticRouting = DynamicCast<Ipv4StaticRouting>(proto);
+        if (staticRouting) break;
+    }
+
+    if (!staticRouting) return;
+
+    for (uint32_t i = 0; i < staticRouting->GetNRoutes(); i++)
+    {
+        Ipv4RoutingTableEntry route = staticRouting->GetRoute(i);
+
+        // if (route.GetDest() == Ipv4Address("10.1.0.1"))
+        if (route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0"))
+        {
+            std::string src = "UNKNOWN";
+
+            auto nodeIt = g_routeSource.find(node->GetId());
+            if (nodeIt != g_routeSource.end())
+            {
+                auto routeIt = nodeIt->second.find(route.GetDest());
+                if (routeIt != nodeIt->second.end())
+                    src = routeIt->second;
+            }
+
+            if (src == "UNKNOWN")
+            {
+                std::cout << "[WARN] Unknown route source for node "
+                        << node->GetId() << std::endl;
+            }
+
+            g_routeDebugFile
+                << Simulator::Now().GetSeconds() << ","
+                << node->GetId() << ","
+                << route.GetDest() << ","
+                << route.GetGateway() << ","
+                << src << ",USED\n";
+        }
+    }
+}
 void MonitorRxCallback(Ptr<const Packet> p) { g_pdrRxTotal++; }
 
 void RecordPdrPerSecond(std::string filename) {
@@ -100,92 +264,6 @@ void RecordCacheStatus(std::string filename) {
     currentTime += 1.0;
     Simulator::Schedule(Seconds(1.0), &RecordCacheStatus, filename);
 }
-
-// ============================================================================
-//                      CONFIGURATION CONSTANTS
-// ============================================================================
-// === TIMING PARAMETERS (seconds) ===
-const double REPORT_INTERVAL = 0.25;
-const double ROUTE_RECOMPUTE_INTERVAL = 0.5; // Old 0.25
-const double CONTROLLER_START_TIME = 0.2;
-const double JITTER_MULTIPLIER = 0.002;
-const double ROUTE_UPDATE_INTERVAL = 0.5;      // How often vehicles update routing table from journey
-
-// === VOEG PARAMETERS ===
-const double PREDICTION_HORIZON = 20.0;        // Time slots to predict ahead old 25 then 10 now 70
-const double TIME_SLOT_DURATION = 0.5;         // Seconds per time slot
-const double TRANSMISSION_RANGE = 250.0;       // Meters Old 250
-const double TRANSMISSION_DELAY = 0.01;        // Seconds per hop (unused: placeholder)
-const double MIN_LINK_RELIABILITY = 0.1;       // Threshold for valid links
-const int    MSG_PREDICTION_SLOTS = 10;         // Future time slots included in each route message old 3
-// Note: TIME_SLOT_DURATION is used as a divisor; must remain positive.
-
-// === DISTANCE THRESHOLDS (meters) ===
-const double WIFI_DATA_MAX_RANGE = 350.0;
-const double WIFI_CTRL_MAX_RANGE = 15000.0;    // Entire map should be able to acess the controller
-
-// === NETWORK INTERFACE INDICES ===
-const uint32_t DATA_IF_INDEX = 1;
-const uint32_t CTRL_IF_INDEX = 2;
-const uint32_t CTRL_NODE_IF_INDEX = 1;
-
-// === UDP PORTS ===
-const uint16_t CONTROLLER_REPORT_PORT = 9999;
-const uint16_t VEHICLE_ROUTE_PORT = 10000;
-const uint16_t DATA_APP_PORT = 9;
-
-// === APPLICATION TIMING ===
-const double SERVER_START_TIME = 5.0;
-const double CLIENT_START_TIME = 10.0;
-const double VEHICLE_APP_START_OFFSET = 0.5;
-const double VEHICLE_APP_STAGGER = 0.01;
-
-// === SCHEDULING OFFSETS ===
-const double CONTROLLER_SEND_OFFSET      = 0.0005;
-const double PREDICTION_MESSAGE_OFFSET   = 0.0001; // Ensures P msg is sent after S msg per vehicle
-
-// === SPECIAL NODE IDs ===
-// const uint32_t CONTROLLER_NODE_ID = 50;
-uint32_t g_controllerId = 0;
-
-// === FAILURE RECOVERY ===
-const double CONTROLLER_TIMEOUT = 2.0;
-const double HEARTBEAT_CHECK_INTERVAL = 0.5;
-
-// === IP CONFIGURATION ===
-const char* DATA_NETWORK_PREFIX = "10.1.0.0";
-const char* DATA_NETWORK_MASK   = "255.255.0.0";
-const char* CTRL_NETWORK_PREFIX = "10.2.0.0";
-const char* CTRL_NETWORK_MASK   = "255.255.0.0";
-
-// === APPLICATION PARAMETERS ===
-const uint32_t MAX_PACKETS    = 100000;
-const double   PACKET_INTERVAL = 0.02; // Old 0.1
-const uint32_t PACKET_SIZE    = 1024;
-
-
-double g_totalPathLength = 0.0;
-uint32_t g_totalPaths = 0;
-uint32_t g_totalInstalledRoutes = 0;
-uint32_t g_totalRouteSamples = 0;
-double g_firstPredictionActivation = -1.0;
-// ============================================================================
-//                      VOEG DATA STRUCTURES
-// ============================================================================
-
-// Snapshot of the network topology at one predicted time slot
-struct TimeSlotGraph {
-    int timeSlot;
-    std::map<uint32_t, std::set<uint32_t>>            adjacency;       // node -> neighbors
-    std::map<std::pair<uint32_t,uint32_t>, double>    linkReliability; // (i,j) -> reliability
-};
-
-// Per-vehicle mobility state stored at the controller
-struct VehicleState {
-    uint32_t nodeId;
-    Vector   position;
-    Vector   velocity;
-};
 
 // ============================================================================
 //                      LINK RELIABILITY CALCULATION
@@ -435,8 +513,6 @@ public:
     }
 
 private:
-    Ptr<Socket> m_reportSocket;
-
     virtual void StartApplication() {
         // Reset last-contact time to now so we don't immediately time out
         m_lastControllerContact = Simulator::Now();
@@ -536,6 +612,12 @@ private:
                 NS_LOG_UNCOND("[" << Simulator::Now().GetSeconds() << "s] Node "
                               << GetNode()->GetId()
                               << ": Controller reconnected! Switching back to SDN routing");
+                std::cout << "[MODE] Node "
+                            << GetNode()->GetId()
+                            << " using "
+                            << (m_usingSdnRouting ? "SDN" : "PRED")
+                            << " at " << Simulator::Now().GetSeconds()
+                            << "s\n";
             }
             std::string dstStr, nhStr;
             while (ss >> dstStr >> nhStr) {
@@ -547,10 +629,31 @@ private:
             // Prediction cache update — store but do NOT install while controller is alive
             int timeSlot;
             std::string dstStr, nhStr;
-            while (ss >> timeSlot >> dstStr >> nhStr) {
+
+            while (ss >> timeSlot >> dstStr >> nhStr){
                 if (dstStr.find('.') == std::string::npos) continue;
-                m_predictionRoutes[Ipv4Address(dstStr.c_str())][timeSlot] =
-                    Ipv4Address(nhStr.c_str());
+
+                Ipv4Address dst(dstStr.c_str());
+                Ipv4Address nh(nhStr.c_str());
+
+                auto& slotMap = m_predictionRoutes[dst];
+
+                slotMap[timeSlot] = nh;
+
+                // ---- Sliding window pruning ----
+                double now = Simulator::Now().GetSeconds();
+                int currentSlot = static_cast<int>(now / TIME_SLOT_DURATION);
+
+                int minSlot = currentSlot - PREDICTION_WINDOW_BACK;
+                int maxSlot = currentSlot + PREDICTION_WINDOW_FRONT;
+
+                for (auto it = slotMap.begin(); it != slotMap.end(); )
+                {
+                    if (it->first < minSlot || it->first > maxSlot)
+                        it = slotMap.erase(it);
+                    else
+                        ++it;
+                }
             }
         }
     }
@@ -574,26 +677,67 @@ private:
             return;
         }
 
-        for (auto& [dst, slotMap] : m_predictionRoutes) {
-            // Find the closest slot entry at or before currentSlot.
-            auto it = slotMap.upper_bound(currentSlot);
-            if (it == slotMap.begin()) continue;
-            --it; // it->first <= currentSlot
+        if (m_predictionRoutes.empty())
+        {
+            std::cout << "[WARN] Node " << GetNode()->GetId()
+                    << " prediction cache empty\n";
+        }
 
-            Ipv4Address nh = it->second;
+        for (auto& [dst, slotMap] : m_predictionRoutes)
+        {
+            Ipv4Address nh;
+            bool found = false;
+            auto it = slotMap.lower_bound(currentSlot - SLOT_TOLERANCE);
+            while (it != slotMap.end() && it->first <= currentSlot + SLOT_TOLERANCE)
+            {
+                nh = it->second;
+                g_cacheHits++;
+                found = true;
+                break;
+            }
 
-            if (it->first < currentSlot) g_cacheHits++;
-            else                         g_cacheMisses++;
+            if (!found)
+            {
+                auto past = slotMap.upper_bound(currentSlot);
 
-            for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--) {
+                if (past == slotMap.begin())
+                    continue;
+
+                --past;
+                nh = past->second;
+                g_cacheMisses++;
+            }
+
+            // Remove old route
+            for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--)
+            {
                 Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+
                 if (route.GetDest() == dst &&
                     route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
-                    route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) == Ipv4Address("10.1.0.0")) {
+                    route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) ==
+                    Ipv4Address("10.1.0.0"))
+                {
                     staticRouting->RemoveRoute(i-1);
                 }
             }
+
+            // DEBUG: log prediction route choice
+            std::cout << "[PRED ROUTE] node "
+                    << GetNode()->GetId()
+                    << " dst " << dst
+                    << " via " << nh
+                    << " slot " << currentSlot
+                    << std::endl;
+
+            // Install predicted route
             staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+            g_routeSource[GetNode()->GetId()][dst] = "PREDICTION";
+            g_routeDebugFile
+                << Simulator::Now().GetSeconds() << ","
+                << GetNode()->GetId() << ","
+                << dst << ","
+                << nh << ",PREDICTION\n";
         }
 
         m_routeUpdateEvent = Simulator::Schedule(
@@ -622,16 +766,6 @@ private:
         }
         return nullptr;
     }
-
-    // Purge all SDN host routes and reinstall from m_activeRoutes.
-    // void InstallActiveRoutes() {
-    //     Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
-    //     if (!staticRouting) return;
-    //     PurgeSDNRoutes(staticRouting);
-    //     for (auto& [dst, nh] : m_activeRoutes) {
-    //         staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
-    //     }
-    // }
 
     void InstallActiveRoutes() {
         Ptr<Ipv4StaticRouting> staticRouting = GetStaticRouting();
@@ -685,8 +819,17 @@ private:
             // Add new route if it didn’t exist or was removed
             if (!routeExists || needsUpdate) {
                 staticRouting->AddHostRouteTo(dst, newNh, m_dataIfIndex, 0);
+                g_routeSource[GetNode()->GetId()][dst] = "SDN";
+                g_routeDebugFile
+                    << Simulator::Now().GetSeconds() << ","
+                    << GetNode()->GetId() << ","
+                    << dst << ","
+                    << newNh << ",SDN\n";
             }
         }
+
+
+
         g_totalInstalledRoutes += m_activeRoutes.size();
         g_totalRouteSamples++;
     }
@@ -699,6 +842,13 @@ private:
                           << ": Controller timeout (" << timeSince
                           << "s)! Switching to prediction routing");
             m_usingSdnRouting = false;
+            std::cout << "[MODE] Node "
+                    << GetNode()->GetId()
+                    << " using "
+                    << (m_usingSdnRouting ? "SDN" : "PRED")
+                    << " at " << Simulator::Now().GetSeconds()
+                    << "s\n";
+
             if (g_firstPredictionActivation < 0)
             {
                 g_firstPredictionActivation = Simulator::Now().GetSeconds();
@@ -706,6 +856,7 @@ private:
             Simulator::Cancel(m_routeUpdateEvent);
             if (m_enablePredictionCache && !m_predictionRoutes.empty()) {
                 NS_LOG_UNCOND("  Using VoEG prediction cache for continued routing");
+                std::cout << "Prediction routes available: " << m_predictionRoutes.size() << std::endl;
             } else {
                 NS_LOG_UNCOND("  Controller down — no prediction routes available");
             }
@@ -723,6 +874,8 @@ private:
     bool        m_usingSdnRouting;
     bool        m_enablePredictionCache;
     Time        m_lastControllerContact;
+    
+    Ptr<Socket> m_reportSocket;
 
     // Active SDN routes (installed while controller is reachable): dst -> next-hop
     std::map<Ipv4Address, Ipv4Address> m_activeRoutes;
@@ -758,7 +911,7 @@ private:
         m_recvSocket->SetRecvCallback(
             MakeCallback(&SdnControllerApp::ReceiveReport, this));
         m_routeEvent = Simulator::Schedule(
-            Seconds(2.0), &SdnControllerApp::RecomputeRoutes, this); // Seconds(CONTROLLER_START_TIME)
+            Seconds(CONTROLLER_START_TIME), &SdnControllerApp::RecomputeRoutes, this); // Seconds(CONTROLLER_START_TIME)
     }
 
     virtual void StopApplication() {
@@ -888,6 +1041,25 @@ private:
     void RecomputeRoutes()
     {
         if (!g_voegNodes) return;
+        double now = Simulator::Now().GetSeconds();
+        static bool logged = false;
+        
+        if (g_failureStartTime >= 0 &&
+            now >= g_failureStartTime &&
+            now <= (g_failureStartTime + g_failureDuration))
+        {
+            // Controller is offline — skip route computation
+            if (!logged)
+            {
+                logged = true;
+                std::cout << "Controller faulure active" << std::endl;
+            }
+            m_routeEvent = Simulator::Schedule(
+                Seconds(ROUTE_RECOMPUTE_INTERVAL),
+                &SdnControllerApp::RecomputeRoutes,
+                this);
+            return;
+        }
 
         if (!m_enablePrediction)
         {
@@ -983,15 +1155,15 @@ private:
 
                     nextHop[dst] = curr;
                 }
-                if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
-                {
-                    if (nextHop.find(0) == nextHop.end())
-                    {
-                        std::cout << "[" << Simulator::Now().GetSeconds()
-                                << "s] NO PATH from "
-                                << srcId << " to 0\n";
-                    }
-                }
+                // if (srcId == g_voegNodes->GetN() - 2)  // last vehicle (since controller is last node)
+                // {
+                //     if (nextHop.find(0) == nextHop.end())
+                //     {
+                //         std::cout << "[" << Simulator::Now().GetSeconds()
+                //                 << "s] NO PATH from "
+                //                 << srcId << " to 0\n";
+                //     }
+                // }
 
                 if (nextHop.empty())
                     continue;
@@ -1130,6 +1302,65 @@ private:
     uint32_t                          m_ctrlIfIndex;
 };
 
+// Helper for installing nodes
+void InstallTrafficFlows(
+    NodeContainer& vehicles,
+    Ipv4InterfaceContainer& ifData,
+    uint32_t numFlows,
+    bool randomPairs,
+    double simTime)
+{
+    Ptr<UniformRandomVariable> rand = CreateObject<UniformRandomVariable>();
+
+    std::set<std::pair<uint32_t,uint32_t>> usedPairs;
+
+    for (uint32_t i = 0; i < numFlows; i++)
+    {
+        uint32_t src;
+        uint32_t dst;
+
+        if (randomPairs)
+        {
+            do
+            {
+                src = rand->GetInteger(0, vehicles.GetN()-1);
+                dst = rand->GetInteger(0, vehicles.GetN()-1);
+            }
+            while (src == dst || usedPairs.count({src,dst}));
+        }
+        else
+        {
+            src = vehicles.GetN()-1-i;
+            dst = i;
+        }
+
+        usedPairs.insert({src,dst});
+
+        uint16_t port = DATA_APP_PORT + i;
+
+        UdpEchoServerHelper server(port);
+        auto serverApps = server.Install(vehicles.Get(dst));
+        serverApps.Start(Seconds(SERVER_START_TIME));
+        serverApps.Stop(Seconds(simTime));
+
+        UdpEchoClientHelper client(ifData.GetAddress(dst), port);
+        client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
+        client.SetAttribute("Interval", TimeValue(Seconds(PACKET_INTERVAL)));
+        client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
+
+        auto clientApps = client.Install(vehicles.Get(src));
+
+        Ptr<UniformRandomVariable> jitter = CreateObject<UniformRandomVariable>();
+        double start = CLIENT_START_TIME + jitter->GetValue(0.0,0.2);
+        clientApps.Start(Seconds(start));
+        clientApps.Stop(Seconds(simTime));
+
+        std::cout << "Flow " << i
+                  << " : Node " << src
+                  << " → Node " << dst << std::endl;
+    }
+}
+
 // ============================================================================
 //                                MAIN
 // ============================================================================
@@ -1143,25 +1374,31 @@ int main(int argc, char* argv[])
     std::string traceFile             = "";
     std::string outputDir             = ".";
     double      simTime               = 150.0;
-    uint32_t    numNodes              = 60;
+    uint32_t    numNodes              = 40;
     bool        enableNetAnim         = false;
     bool        enableFailure         = false;
     bool        enablePredictionCache = false;
     double      failureStart          = -1.0;
     double      failureDuration       = 0.0;
+    bool        randomFlows           = false;
+    bool        multiFlows            = false;
+    uint32_t    numFlows              = 5;
 
     CommandLine cmd;
-    cmd.AddValue("protocol",              "Protocol (VOEG)",                           protocol);
-    cmd.AddValue("scenario",              "Simulation scenario (grid/highway/city)",   scenario);
-    cmd.AddValue("speed",                 "Vehicle speed for mobility file selection", speed);
-    cmd.AddValue("runId",                 "Simulation run ID",                         runId);
-    cmd.AddValue("traceFile",             "Path to mobility trace file",               traceFile);
-    cmd.AddValue("outputDir",             "Output directory for results",              outputDir);
-    cmd.AddValue("netanim",               "Enable NetAnim output",                     enableNetAnim);
-    cmd.AddValue("enableFailure",         "Enable controller failure simulation",      enableFailure);
-    cmd.AddValue("enablePredictionCache", "Enable local route caching",                enablePredictionCache);
-    cmd.AddValue("failureStart",          "Controller failure start time (-1=disabled)", failureStart);
-    cmd.AddValue("failureDuration",       "Controller failure duration in seconds",    failureDuration);
+    cmd.AddValue("protocol",              "Protocol (VOEG)",                            protocol);
+    cmd.AddValue("scenario",              "Simulation scenario (grid/highway/city)",    scenario);
+    cmd.AddValue("speed",                 "Vehicle speed for mobility file selection",  speed);
+    cmd.AddValue("runId",                 "Simulation run ID",                          runId);
+    cmd.AddValue("traceFile",             "Path to mobility trace file",                traceFile);
+    cmd.AddValue("outputDir",             "Output directory for results",               outputDir);
+    cmd.AddValue("netanim",               "Enable NetAnim output",                      enableNetAnim);
+    cmd.AddValue("enableFailure",         "Enable controller failure simulation",       enableFailure);
+    cmd.AddValue("enablePredictionCache", "Enable local route caching",                 enablePredictionCache);
+    cmd.AddValue("failureStart",          "Controller failure start time (-1=disabled)",failureStart);
+    cmd.AddValue("failureDuration",       "Controller failure duration in seconds",     failureDuration);
+    cmd.AddValue("randomFlows",           "Randomize client/server pairs",              randomFlows);
+    cmd.AddValue("multiFlows",            "Enable multiple concurrent flows",           multiFlows);
+    cmd.AddValue("numFlows",              "Number of concurrent flows (multiFlows)",    numFlows);
     cmd.Parse(argc, argv);
 
     // If failure flag is set but no time specified, use defaults
@@ -1177,10 +1414,14 @@ int main(int argc, char* argv[])
         traceFile = "scratch/mobility/" + scenario + "/mobility_" + std::to_string(speed) + ".tcl";
     }
 
-    std::string xmlFileName  = outputDir + "/result_VOEG_"      + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
-    std::string csvFileName  = outputDir + "/pdr_graph_VOEG_"   + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string cachFileName = outputDir + "/cache_status_VOEG_"+ scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
-    std::string animFileName = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string xmlFileName        = outputDir + "/result_VOEG_"      + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string csvFileName        = outputDir + "/pdr_graph_VOEG_"   + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string cachFileName       = outputDir + "/cache_status_VOEG_"+ scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+    std::string animFileName       = outputDir + "/netanim_VOEG_"     + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".xml";
+    std::string routeDebugFileName = outputDir + "/route_debug_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".csv";
+
+    g_routeDebugFile.open(routeDebugFileName);
+    g_routeDebugFile << "Time,Node,Destination,NextHop,Source\n";
 
     RngSeedManager::SetSeed(3 + runId);
     RngSeedManager::SetRun(runId);
@@ -1298,19 +1539,30 @@ int main(int argc, char* argv[])
         app->SetStopTime(Seconds(simTime));
     }
 
-    // Data application: echo client (vehicle N-1) → echo server (vehicle 0)
-    UdpEchoServerHelper server(DATA_APP_PORT);
-    ApplicationContainer serverApps = server.Install(vehicles.Get(0));
-    serverApps.Start(Seconds(SERVER_START_TIME));
-    serverApps.Stop(Seconds(simTime));
+    if (multiFlows)
+    {
+        InstallTrafficFlows(vehicles, ifData, numFlows, randomFlows, simTime);
+    }
+    else if (randomFlows)
+    {
+        InstallTrafficFlows(vehicles, ifData, 1, true, simTime);
+    }
+    else
+    {
+        // Data application: echo client (vehicle N-1) → echo server (vehicle 0)
+        UdpEchoServerHelper server(DATA_APP_PORT);
+        ApplicationContainer serverApps = server.Install(vehicles.Get(0));
+        serverApps.Start(Seconds(SERVER_START_TIME));
+        serverApps.Stop(Seconds(simTime));
 
-    UdpEchoClientHelper client(ifData.GetAddress(0), DATA_APP_PORT);
-    client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
-    client.SetAttribute("Interval",   TimeValue(Seconds(PACKET_INTERVAL)));
-    client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
-    ApplicationContainer clientApps = client.Install(vehicles.Get(numNodes - 1));
-    clientApps.Start(Seconds(CLIENT_START_TIME));
-    clientApps.Stop(Seconds(simTime));
+        UdpEchoClientHelper client(ifData.GetAddress(0), DATA_APP_PORT);
+        client.SetAttribute("MaxPackets", UintegerValue(MAX_PACKETS));
+        client.SetAttribute("Interval",   TimeValue(Seconds(PACKET_INTERVAL)));
+        client.SetAttribute("PacketSize", UintegerValue(PACKET_SIZE));
+        ApplicationContainer clientApps = client.Install(vehicles.Get(numNodes - 1));
+        clientApps.Start(Seconds(CLIENT_START_TIME));
+        clientApps.Stop(Seconds(simTime));
+    }
 
     // --------------------------------------------------------------------------
     //  FlowMonitor
@@ -1357,67 +1609,81 @@ int main(int argc, char* argv[])
     // Updated Output: PDR, Throughput, and Delay
     std::ofstream finalStats(outputDir + "/final_stats_VOEG_" + scenario + "_" + std::to_string(speed) + "_" + std::to_string(runId) + ".txt");
     
-    for (auto const& [flowId, flowStats] : stats) {
+    double totalTx = 0;
+    double totalRx = 0;
+
+    for (auto const& [flowId, flowStats] : stats)
+    {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flowId);
-        
-        // Only count data flows (port 9)
-        if (t.destinationPort == DATA_APP_PORT) {
-            
-            // 1. Packet Delivery Ratio (PDR)
-            double pdr = (flowStats.txPackets > 0) ? 
-                         std::min(100.0, 100.0 * flowStats.rxPackets / flowStats.txPackets) : 0.0;
-            
-            // 2. Throughput (in Kbps)
-            double throughput = 0.0;
-            double duration = (flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket).GetSeconds();
-            if (duration > 0 && flowStats.rxPackets > 0) {
-                // rxBytes * 8 bits / (duration in seconds * 1000) = Kbps
-                throughput = (flowStats.rxBytes * 8.0) / (duration * 1000.0);
-            }
-            // 3. Average End-to-End Delay (in ms)
-            double delay = 0.0;
-            if (flowStats.rxPackets > 0) {
-                delay = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000.0;
-            }
-            finalStats << "Flow ID     : " << flowId << "\n"
-                       << "Connection  : " << t.sourceAddress << " -> " << t.destinationAddress << "\n"
-                       << "Tx Packets  : " << flowStats.txPackets << "\n"
-                       << "Rx Packets  : " << flowStats.rxPackets << "\n"
-                       << "PDR         : " << pdr << " %\n"
-                       << "Throughput  : " << throughput << " kbps\n"
-                       << "Avg Delay   : " << delay << " ms\n"
-                       << "------------------------------------------------\n";
-            finalStats << "\n===== VOEG ADDITIONAL METRICS =====\n";
 
-            // ---- Average Path Length ----
-            double avgPathLen = (g_totalPaths > 0) ?
-                g_totalPathLength / g_totalPaths : 0.0;
+        // ---- Packet Delivery Ratio ----
+        double pdr = 0.0;
+        if (flowStats.txPackets > 0)
+            pdr = 100.0 * flowStats.rxPackets / flowStats.txPackets;
 
-            finalStats << "Average Path Length (hops): "
-                    << avgPathLen << "\n";
+        // ---- Throughput ----
+        double throughput = 0.0;
+        double duration =
+            (flowStats.timeLastRxPacket - flowStats.timeFirstTxPacket).GetSeconds();
 
-            // ---- Avg SDN Routes Per Node ----
-            double avgRoutes = (g_totalRouteSamples > 0) ?
-                (double)g_totalInstalledRoutes / g_totalRouteSamples : 0.0;
+        if (duration > 0 && flowStats.rxPackets > 0)
+            throughput = (flowStats.rxBytes * 8.0) / (duration * 1000.0);
 
-            finalStats << "Average SDN Routes Installed per Node: "
-                    << avgRoutes << "\n";
+        // ---- Average Delay ----
+        double delay = 0.0;
+        if (flowStats.rxPackets > 0)
+            delay = (flowStats.delaySum.GetSeconds() / flowStats.rxPackets) * 1000.0;
 
-            // ---- Failure → Prediction Delay ----
-            if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
-            {
-                double activationDelay =
-                    g_firstPredictionActivation - g_failureStartTime;
+        finalStats << "Flow ID     : " << flowId << "\n"
+                << "Connection  : " << t.sourceAddress
+                << " -> " << t.destinationAddress << "\n"
+                << "Tx Packets  : " << flowStats.txPackets << "\n"
+                << "Rx Packets  : " << flowStats.rxPackets << "\n"
+                << "PDR         : " << pdr << " %\n"
+                << "Throughput  : " << throughput << " kbps\n"
+                << "Avg Delay   : " << delay << " ms\n"
+                << "------------------------------------------------\n";
 
-                finalStats << "Failure to Prediction Activation Delay: "
-                        << activationDelay << " s\n";
-            }
-            else
-            {
-                finalStats << "Failure to Prediction Activation Delay: N/A\n";
-            }
-        }
+        totalTx += flowStats.txPackets;
+        totalRx += flowStats.rxPackets;
     }
+    double overallPdr = (totalTx > 0) ? 100.0 * totalRx / totalTx : 0.0;
+
+    finalStats << "\n===== NETWORK TOTAL =====\n";
+    finalStats << "Total Tx Packets : " << totalTx << "\n";
+    finalStats << "Total Rx Packets : " << totalRx << "\n";
+    finalStats << "Overall PDR      : " << overallPdr << " %\n";
+
+    finalStats << "\n===== VOEG ADDITIONAL METRICS =====\n";
+
+    double avgPathLen = (g_totalPaths > 0)
+        ? g_totalPathLength / g_totalPaths : 0.0;
+
+    finalStats << "Average Path Length (hops): "
+            << avgPathLen << "\n";
+
+    double avgRoutes = (g_totalRouteSamples > 0)
+        ? (double)g_totalInstalledRoutes / g_totalRouteSamples : 0.0;
+
+    finalStats << "Average SDN Routes Installed per Node: "
+            << avgRoutes << "\n";
+
+    if (g_failureStartTime >= 0 && g_firstPredictionActivation > 0)
+    {
+        double activationDelay = 0;
+
+        if (g_firstPredictionActivation >= g_failureStartTime)
+            activationDelay =
+                g_firstPredictionActivation - g_failureStartTime;
+
+        finalStats << "Failure to Prediction Activation Delay: "
+                << activationDelay << " s\n";
+    }
+    else
+    {
+        finalStats << "Failure to Prediction Activation Delay: N/A\n";
+    }
+    
     finalStats.close();
     Simulator::Destroy();
     return 0;
