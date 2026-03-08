@@ -718,36 +718,47 @@ private:
                 g_cacheMisses++;
             }
 
-            // Remove old route
-            for (uint32_t i = staticRouting->GetNRoutes(); i > 0; i--)
-            {
-                Ipv4RoutingTableEntry route = staticRouting->GetRoute(i-1);
+            bool routeExists = false;
+            bool needsUpdate = false;
 
-                if (route.GetDest() == dst &&
-                    route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255") &&
-                    route.GetDest().CombineMask(Ipv4Mask("255.255.0.0")) ==
-                    Ipv4Address("10.1.0.0"))
+            // Remove old route if it has changed
+            for (int32_t i = staticRouting->GetNRoutes() - 1; i >= 0; --i)
+            {
+                Ipv4RoutingTableEntry route = staticRouting->GetRoute(i);
+
+                if (route.GetDest() == dst && route.GetDestNetworkMask() == Ipv4Mask("255.255.255.255"))
                 {
-                    staticRouting->RemoveRoute(i-1);
+                    routeExists = true;
+
+                    if (route.GetGateway() != nh)
+                    {
+                        staticRouting->RemoveRoute(i);
+                        needsUpdate = true;
+                    }
+
+                    break;
                 }
             }
 
-            // DEBUG: log prediction route choice
-            std::cout << "[PRED ROUTE] node "
-                    << GetNode()->GetId()
-                    << " dst " << dst
-                    << " via " << nh
-                    << " slot " << currentSlot
-                    << std::endl;
-
             // Install predicted route
-            staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
-            g_routeSource[GetNode()->GetId()][dst] = "PREDICTION";
-            g_routeDebugFile
-                << Simulator::Now().GetSeconds() << ","
-                << GetNode()->GetId() << ","
-                << dst << ","
-                << nh << ",PREDICTION\n";
+            if (!routeExists || needsUpdate)
+            {
+                staticRouting->AddHostRouteTo(dst, nh, m_dataIfIndex, 0);
+                // DEBUG: log prediction route choice
+                std::cout << "[PRED ROUTE] node "
+                        << GetNode()->GetId()
+                        << " dst " << dst
+                        << " via " << nh
+                        << " slot " << currentSlot
+                        << std::endl;
+
+                g_routeSource[GetNode()->GetId()][dst] = "PREDICTION";
+                g_routeDebugFile
+                    << Simulator::Now().GetSeconds() << ","
+                    << GetNode()->GetId() << ","
+                    << dst << ","
+                    << nh << ",PREDICTION\n";
+            }
         }
 
         m_routeUpdateEvent = Simulator::Schedule(
