@@ -198,7 +198,7 @@ void MonitorTxCallback(Ptr<const Packet> p)
             Ipv4Address& lastGw   = g_lastRouteGateway[node->GetId()][route.GetDest()];
 
             // Only write a record when the gateway has changed
-            if (currentGw == lastGw) break;
+            if (currentGw == lastGw) continue;
             lastGw = currentGw;
 
             std::string src = "UNKNOWN";
