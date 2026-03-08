@@ -214,10 +214,8 @@ void MonitorTxCallback(Ptr<const Packet> p)
                 << Simulator::Now().GetSeconds() << ","
                 << node->GetId() << ","
                 << route.GetDest() << ","
-                << currentGw << ","
-                << src << "\n";
-
-            break;
+                << route.GetGateway() << ","
+                << src << ",USED\n";
         }
     }
 }
@@ -562,6 +560,7 @@ private:
         Simulator::Cancel(m_heartbeatEvent);
         Simulator::Cancel(m_routeUpdateEvent);
         if (m_ctrlRx) m_ctrlRx->Close();
+        if (m_reportSocket) m_reportSocket->Close();
     }
 
     // Send position + velocity report to controller
@@ -687,14 +686,14 @@ private:
             return;
         }
 
+        if (m_predictionRoutes.empty())
+        {
+            std::cout << "[WARN] Node " << GetNode()->GetId()
+                    << " prediction cache empty\n";
+        }
+
         for (auto& [dst, slotMap] : m_predictionRoutes)
         {
-            if (m_predictionRoutes.empty())
-            {
-                std::cout << "[WARN] Node " << GetNode()->GetId()
-                        << " prediction cache empty\n";
-            }
-            
             Ipv4Address nh;
             bool found = false;
             auto it = slotMap.lower_bound(currentSlot - SLOT_TOLERANCE);
