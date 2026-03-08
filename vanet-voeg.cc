@@ -980,7 +980,6 @@ private:
         // Collect all node IDs once
         std::vector<uint32_t> ids;
         ids.reserve(m_vehicleStates.size());
-        double now = Simulator::Now().GetSeconds();
 
         for (uint32_t i = 0; i < g_voegNodes->GetN(); ++i)
         {
