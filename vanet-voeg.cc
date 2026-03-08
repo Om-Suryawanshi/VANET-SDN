@@ -208,8 +208,6 @@ void MonitorTxCallback(Ptr<const Packet> p)
                 << route.GetDest() << ","
                 << route.GetGateway() << ","
                 << src << ",USED\n";
-
-            break;
         }
     }
 }
